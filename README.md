@@ -14,7 +14,10 @@ Run `make help` or take a look at our [`Makefile`](./Makefile) for other useful 
 
 ## Running in a devnet
 
+<!-- TODO: add small tutorial here? -->
+
 To quickly spin up a devnet, see [lean-quickstart](https://github.com/blockblaz/lean-quickstart).
+We have a WIP integration with it [in our fork](https://github.com/lambdaclass/lean-quickstart/tree/add-ethlambda).
 
 ## Philosophy
 
