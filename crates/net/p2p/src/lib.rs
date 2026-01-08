@@ -6,16 +6,21 @@ use ethrex_rlp::decode::RLPDecode;
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol,
     futures::StreamExt,
-    gossipsub::{self, MessageAuthenticity, ValidationMode},
+    gossipsub::{MessageAuthenticity, ValidationMode},
     identity::{PublicKey, secp256k1},
     multiaddr::Protocol,
-    request_response::{self, Event, Message},
+    request_response,
     swarm::{NetworkBehaviour, SwarmEvent},
 };
+use sha2::Digest;
 use tracing::{info, trace};
 
-use crate::messages::status::{STATUS_PROTOCOL_V1, Status};
+use crate::{
+    gossipsub::{ATTESTATION_TOPIC_KIND, BLOCK_TOPIC_KIND},
+    messages::status::{STATUS_PROTOCOL_V1, Status},
+};
 
+mod gossipsub;
 mod messages;
 
 pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16) {
@@ -35,12 +40,14 @@ pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16) {
         // seen_ttl_secs = seconds_per_slot * justification_lookback_slots * 2
         .duplicate_cache_time(Duration::from_secs(4 * 3 * 2))
         .validation_mode(ValidationMode::Anonymous)
+        .message_id_fn(compute_message_id)
         .build()
         .expect("invalid gossipsub config");
 
     // TODO: setup custom message ID function
     let gossipsub = libp2p::gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, config)
         .expect("failed to initiate behaviour");
+
     let req_resp = request_response::Behaviour::new(
         vec![(
             StreamProtocol::new(STATUS_PROTOCOL_V1),
@@ -93,6 +100,14 @@ pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16) {
         .listen_on(addr)
         .expect("failed to bind gossipsub listening address");
 
+    let topic_kinds = [BLOCK_TOPIC_KIND, ATTESTATION_TOPIC_KIND];
+    let network = "devnet0";
+    for topic_kind in topic_kinds {
+        let topic_str = format!("/leanconsensus/{network}/{topic_kind}/ssz_snappy");
+        let topic = libp2p::gossipsub::IdentTopic::new(topic_str);
+        swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
+    }
+
     println!("P2P node started on port {listening_port}");
 
     event_loop(swarm).await;
@@ -101,7 +116,7 @@ pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16) {
 /// [libp2p Behaviour](libp2p::swarm::NetworkBehaviour) combining Gossipsub and Request-Response Behaviours
 #[derive(NetworkBehaviour)]
 struct Behaviour {
-    gossipsub: gossipsub::Behaviour,
+    gossipsub: libp2p::gossipsub::Behaviour,
     req_resp: request_response::Behaviour<messages::status::StatusCodec>,
 }
 
@@ -110,21 +125,16 @@ struct Behaviour {
 async fn event_loop(mut swarm: libp2p::Swarm<Behaviour>) {
     while let Some(event) = swarm.next().await {
         match event {
-            SwarmEvent::Behaviour(BehaviourEvent::ReqResp(message @ Event::Message { .. })) => {
+            SwarmEvent::Behaviour(BehaviourEvent::ReqResp(
+                message @ request_response::Event::Message { .. },
+            )) => {
                 handle_req_resp_message(&mut swarm, message).await;
             }
-            // SwarmEvent::Behaviour(BehaviourEvent::ReqResp(Event::Message {
-            //     peer,
-            //     connection_id,
-            //     message:
-            //         Message::Request {
-            //             request_id,
-            //             request,
-            //             channel,
-            //         },
-            // })) => {
-            //     info!(finalized_slot=%request.finalized.slot, head_slot=%request.head.slot, "Received status request from peer {peer}");
-            // }
+            SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
+                message @ libp2p::gossipsub::Event::Message { .. },
+            )) => {
+                gossipsub::handle_gossipsub_message(message).await;
+            }
             _ => {
                 trace!(?event, "Ignored swarm event");
             }
@@ -134,9 +144,9 @@ async fn event_loop(mut swarm: libp2p::Swarm<Behaviour>) {
 
 async fn handle_req_resp_message(
     swarm: &mut libp2p::Swarm<Behaviour>,
-    event: Event<Status, Status>,
+    event: request_response::Event<Status, Status>,
 ) {
-    let Event::Message {
+    let request_response::Event::Message {
         peer,
         connection_id: _,
         message,
@@ -145,7 +155,7 @@ async fn handle_req_resp_message(
         unreachable!("we already matched on event_loop");
     };
     match message {
-        Message::Request {
+        request_response::Message::Request {
             request_id: _,
             request,
             channel,
@@ -158,7 +168,7 @@ async fn handle_req_resp_message(
                 .unwrap();
             swarm.behaviour_mut().req_resp.send_request(&peer, request);
         }
-        Message::Response {
+        request_response::Message::Response {
             request_id: _,
             response,
         } => {
@@ -213,4 +223,25 @@ pub fn parse_validators_file(bootnodes_path: &str) -> Vec<Bootnode> {
         });
     }
     bootnodes
+}
+
+fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub::MessageId {
+    const MESSAGE_DOMAIN_INVALID_SNAPPY: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
+    const MESSAGE_DOMAIN_VALID_SNAPPY: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
+
+    let mut hasher = sha2::Sha256::new();
+    let decompressed = snap::raw::Decoder::new().decompress_vec(&message.data);
+
+    let (domain, data) = match decompressed.as_ref() {
+        Ok(decompressed_data) => (MESSAGE_DOMAIN_VALID_SNAPPY, decompressed_data),
+        Err(_) => (MESSAGE_DOMAIN_INVALID_SNAPPY, &message.data),
+    };
+    let topic = message.topic.as_str().as_bytes();
+    let topic_len = (topic.len() as u64).to_be_bytes();
+    hasher.update(&domain);
+    hasher.update(&topic_len);
+    hasher.update(topic);
+    hasher.update(data);
+    let hash = hasher.finalize();
+    libp2p::gossipsub::MessageId(hash[..20].to_vec())
 }
