@@ -6,3 +6,5 @@ pub use tree_hash::TreeHash;
 
 pub use ssz_types::{BitList, BitVector, FixedVector, VariableList};
 pub type H256 = Hash256;
+
+pub type ByteList<N> = ssz_types::VariableList<u8, N>;
