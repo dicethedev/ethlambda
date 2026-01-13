@@ -1,19 +1,37 @@
+use std::{
+    collections::HashMap,
+    time::{Duration, SystemTime},
+};
+
 use ethlambda_storage::Store;
 use ethlambda_types::{
     attestation::SignedAttestation, block::SignedBlockWithAttestation, primitives::TreeHash,
 };
-use spawned_concurrency::tasks::{CallResponse, CastResponse, GenServer, GenServerHandle};
-use tracing::{error, info, warn};
+use spawned_concurrency::tasks::{
+    CallResponse, CastResponse, GenServer, GenServerHandle, send_after,
+};
+use tracing::{error, info, trace, warn};
 
 pub struct BlockChain {
     handle: GenServerHandle<BlockChainServer>,
 }
 
+/// Seconds in a slot. Each slot has 4 intervals of 1 second each.
+const SECONDS_PER_SLOT: u64 = 4;
+
 impl BlockChain {
     pub fn spawn(store: Store) -> BlockChain {
-        BlockChain {
-            handle: BlockChainServer { store }.start(),
+        let genesis_time = store.get_genesis_time();
+        let handle = BlockChainServer {
+            genesis_time,
+            store,
         }
+        .start();
+        let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::default());
+        send_after(time_until_genesis, handle.clone(), CastMessage::Tick);
+        BlockChain { handle }
     }
 
     /// Sends a block to the BlockChain for processing.
@@ -40,10 +58,43 @@ impl BlockChain {
 }
 
 struct BlockChainServer {
+    genesis_time: u64,
     store: Store,
 }
 
 impl BlockChainServer {
+    fn on_tick(&mut self, timestamp: u64) {
+        let time = timestamp - self.genesis_time;
+        // TODO: check if we are proposing
+        let has_proposal = false;
+
+        let slot = time / SECONDS_PER_SLOT;
+        let interval = time % SECONDS_PER_SLOT;
+        trace!(%slot, %interval, "processing tick");
+
+        // NOTE: here we assume on_tick never skips intervals
+        match interval {
+            0 => {
+                // Start of slot - process attestations if proposal exists
+                if has_proposal {
+                    self.store.accept_new_attestations();
+                }
+            }
+            1 => {
+                // Second interval - no action
+            }
+            2 => {
+                // Mid-slot - update safe target for validators
+                self.store.update_safe_target();
+            }
+            3 => {
+                // End of slot - accept accumulated attestations
+                self.store.accept_new_attestations();
+            }
+            _ => unreachable!("slots only have 4 intervals"),
+        }
+    }
+
     fn on_block(&mut self, signed_block: SignedBlockWithAttestation) {
         let slot = signed_block.message.block.slot;
 
@@ -88,6 +139,7 @@ impl BlockChainServer {
 enum CastMessage {
     NewBlock(SignedBlockWithAttestation),
     NewAttestation(SignedAttestation),
+    Tick,
 }
 
 impl GenServer for BlockChainServer {
@@ -110,9 +162,23 @@ impl GenServer for BlockChainServer {
     async fn handle_cast(
         &mut self,
         message: Self::CastMsg,
-        _handle: &GenServerHandle<Self>,
+        handle: &GenServerHandle<Self>,
     ) -> CastResponse {
         match message {
+            CastMessage::Tick => {
+                let timestamp = SystemTime::UNIX_EPOCH
+                    .elapsed()
+                    .expect("already past the unix epoch");
+                self.on_tick(timestamp.as_secs());
+                // Schedule the next tick at the start of the next second
+                let millis_to_next_sec =
+                    ((timestamp.as_secs() as u128 + 1) * 1000 - timestamp.as_millis()) as u64;
+                send_after(
+                    Duration::from_millis(millis_to_next_sec),
+                    handle.clone(),
+                    message,
+                );
+            }
             CastMessage::NewBlock(signed_block) => {
                 self.on_block(signed_block);
             }
