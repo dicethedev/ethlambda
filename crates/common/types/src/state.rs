@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use ssz::DecodeError;
 use ssz_derive::{Decode, Encode};
 use ssz_types::typenum::{U4096, U262144};
 use tree_hash::TreeHash;
@@ -8,6 +9,7 @@ use crate::{
     block::{BlockBody, BlockHeader},
     genesis::Genesis,
     primitives::H256,
+    signature::ValidatorPublicKey,
 };
 
 // Constants
@@ -63,12 +65,18 @@ pub type JustificationValidators =
 #[derive(Debug, Clone, Encode, Decode, TreeHash)]
 pub struct Validator {
     /// XMSS one-time signature public key.
-    pub pubkey: ValidatorPubkey,
+    pub pubkey: ValidatorPubkeyBytes,
     /// Validator index in the registry.
     pub index: u64,
 }
 
-pub type ValidatorPubkey = [u8; 52];
+impl Validator {
+    pub fn get_pubkey(&self) -> Result<ValidatorPublicKey, DecodeError> {
+        ValidatorPublicKey::from_bytes(&self.pubkey)
+    }
+}
+
+pub type ValidatorPubkeyBytes = [u8; 52];
 
 impl State {
     pub fn from_genesis(genesis: &Genesis, validators: Vec<Validator>) -> Self {
@@ -85,19 +93,18 @@ impl State {
         let justifications_validators =
             JustificationValidators::with_capacity(0).expect("failed to initialize empty list");
 
-        let state = State {
+        Self {
             config: genesis.config.clone(),
             slot: 0,
             latest_block_header: genesis_header,
-            latest_justified: genesis.latest_justified.clone(),
-            latest_finalized: genesis.latest_finalized.clone(),
+            latest_justified: genesis.latest_justified,
+            latest_finalized: genesis.latest_finalized,
             historical_block_hashes: Default::default(),
             justified_slots,
             validators,
             justifications_roots: Default::default(),
             justifications_validators,
-        };
-        state
+        }
     }
 }
 
