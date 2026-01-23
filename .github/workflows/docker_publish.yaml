@@ -3,8 +3,8 @@ name: Publish Docker Image
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Docker image tag (e.g., latest, v0.1.0)"
+      tags:
+        description: "Docker image tags, comma-separated (e.g., latest,v0.1.0)"
         required: false
         default: "latest"
 
@@ -42,6 +42,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Prepare tags
+        id: prep
+        run: |
+          TAGS=""
+          IFS=',' read -ra TAG_ARRAY <<< "${{ inputs.tags }}"
+          for t in "${TAG_ARRAY[@]}"; do
+            TAGS="${TAGS}${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${t}-${{ matrix.arch }},"
+          done
+          TAGS="${TAGS%,}"  # Remove trailing comma
+          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
@@ -51,7 +62,7 @@ jobs:
             GIT_COMMIT=${{ github.sha }}
             GIT_BRANCH=${{ github.ref_name }}
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.tag }}-${{ matrix.arch }}
+          tags: ${{ steps.prep.outputs.tags }}
           platforms: linux/${{ matrix.arch }}
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,scope=${{ matrix.arch }},mode=max
@@ -69,12 +80,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create multi-arch manifest
+      - name: Create multi-arch manifests
         env:
           SHORT_SHA: ${{ github.sha }}
         run: |
+          IFS=',' read -ra TAG_ARRAY <<< "${{ inputs.tags }}"
+          FIRST_TAG="${TAG_ARRAY[0]}"
+
+          # Create manifest for first tag with SHA tag
           docker buildx imagetools create \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.tag }} \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${FIRST_TAG} \
             -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${SHORT_SHA::7} \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.tag }}-amd64 \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.tag }}-arm64
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${FIRST_TAG}-amd64 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${FIRST_TAG}-arm64
+
+          # Create manifests for remaining tags
+          for t in "${TAG_ARRAY[@]:1}"; do
+            docker buildx imagetools create \
+              -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${t} \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${t}-amd64 \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${t}-arm64
+          done
