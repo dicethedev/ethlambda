@@ -4,7 +4,10 @@ use crate::api::{StorageBackend, Table};
 
 use ethlambda_types::{
     attestation::AttestationData,
-    block::{AggregatedSignatureProof, Block, BlockBody},
+    block::{
+        AggregatedSignatureProof, Block, BlockBody, BlockSignaturesWithAttestation,
+        BlockWithAttestation, SignedBlockWithAttestation,
+    },
     primitives::{Decode, Encode, H256, TreeHash},
     signature::ValidatorSignature,
     state::{ChainConfig, Checkpoint, State},
@@ -128,44 +131,39 @@ impl Store {
             let mut batch = backend.begin_write().expect("write batch");
 
             // Metadata
+            let metadata_entries = vec![
+                (KEY_TIME.to_vec(), 0u64.as_ssz_bytes()),
+                (KEY_CONFIG.to_vec(), anchor_state.config.as_ssz_bytes()),
+                (KEY_HEAD.to_vec(), anchor_block_root.as_ssz_bytes()),
+                (KEY_SAFE_TARGET.to_vec(), anchor_block_root.as_ssz_bytes()),
+                (
+                    KEY_LATEST_JUSTIFIED.to_vec(),
+                    anchor_checkpoint.as_ssz_bytes(),
+                ),
+                (
+                    KEY_LATEST_FINALIZED.to_vec(),
+                    anchor_checkpoint.as_ssz_bytes(),
+                ),
+            ];
             batch
-                .put_batch(
-                    Table::Metadata,
-                    vec![
-                        (KEY_TIME.to_vec(), 0u64.as_ssz_bytes()),
-                        (KEY_CONFIG.to_vec(), anchor_state.config.as_ssz_bytes()),
-                        (KEY_HEAD.to_vec(), anchor_block_root.as_ssz_bytes()),
-                        (KEY_SAFE_TARGET.to_vec(), anchor_block_root.as_ssz_bytes()),
-                        (
-                            KEY_LATEST_JUSTIFIED.to_vec(),
-                            anchor_checkpoint.as_ssz_bytes(),
-                        ),
-                        (
-                            KEY_LATEST_FINALIZED.to_vec(),
-                            anchor_checkpoint.as_ssz_bytes(),
-                        ),
-                    ],
-                )
+                .put_batch(Table::Metadata, metadata_entries)
                 .expect("put metadata");
 
             // Block and state
+            let block_entries = vec![(
+                anchor_block_root.as_ssz_bytes(),
+                anchor_block.as_ssz_bytes(),
+            )];
             batch
-                .put_batch(
-                    Table::Blocks,
-                    vec![(
-                        anchor_block_root.as_ssz_bytes(),
-                        anchor_block.as_ssz_bytes(),
-                    )],
-                )
+                .put_batch(Table::Blocks, block_entries)
                 .expect("put block");
+
+            let state_entries = vec![(
+                anchor_block_root.as_ssz_bytes(),
+                anchor_state.as_ssz_bytes(),
+            )];
             batch
-                .put_batch(
-                    Table::States,
-                    vec![(
-                        anchor_block_root.as_ssz_bytes(),
-                        anchor_state.as_ssz_bytes(),
-                    )],
-                )
+                .put_batch(Table::States, state_entries)
                 .expect("put state");
 
             batch.commit().expect("commit");
@@ -296,13 +294,67 @@ impl Store {
 
     pub fn insert_block(&mut self, root: H256, block: Block) {
         let mut batch = self.backend.begin_write().expect("write batch");
-        batch
-            .put_batch(
-                Table::Blocks,
-                vec![(root.as_ssz_bytes(), block.as_ssz_bytes())],
-            )
-            .expect("put block");
+        let entries = vec![(root.as_ssz_bytes(), block.as_ssz_bytes())];
+        batch.put_batch(Table::Blocks, entries).expect("put block");
         batch.commit().expect("commit");
+    }
+
+    // ============ Signed Blocks ============
+
+    /// Insert a signed block, storing the block and signatures separately.
+    ///
+    /// Blocks and signatures are stored in separate tables because the genesis
+    /// block has no signatures. This allows uniform storage of all blocks while
+    /// only storing signatures for non-genesis blocks.
+    ///
+    /// Takes ownership to avoid cloning large signature data.
+    pub fn insert_signed_block(&mut self, root: H256, signed_block: SignedBlockWithAttestation) {
+        // Destructure to extract all components without cloning
+        let SignedBlockWithAttestation {
+            message:
+                BlockWithAttestation {
+                    block,
+                    proposer_attestation,
+                },
+            signature,
+        } = signed_block;
+
+        let signatures = BlockSignaturesWithAttestation {
+            proposer_attestation,
+            signatures: signature,
+        };
+
+        let mut batch = self.backend.begin_write().expect("write batch");
+
+        let block_entries = vec![(root.as_ssz_bytes(), block.as_ssz_bytes())];
+        batch
+            .put_batch(Table::Blocks, block_entries)
+            .expect("put block");
+
+        let sig_entries = vec![(root.as_ssz_bytes(), signatures.as_ssz_bytes())];
+        batch
+            .put_batch(Table::BlockSignatures, sig_entries)
+            .expect("put block signatures");
+
+        batch.commit().expect("commit");
+    }
+
+    /// Get a signed block by combining block and signatures.
+    ///
+    /// Returns None if either the block or signatures are not found.
+    /// Note: Genesis block has no entry in BlockSignatures table.
+    pub fn get_signed_block(&self, root: &H256) -> Option<SignedBlockWithAttestation> {
+        let view = self.backend.begin_read().expect("read view");
+        let key = root.as_ssz_bytes();
+
+        let block_bytes = view.get(Table::Blocks, &key).expect("get")?;
+        let sig_bytes = view.get(Table::BlockSignatures, &key).expect("get")?;
+
+        let block = Block::from_ssz_bytes(&block_bytes).expect("valid block");
+        let signatures =
+            BlockSignaturesWithAttestation::from_ssz_bytes(&sig_bytes).expect("valid signatures");
+
+        Some(signatures.to_signed_block(block))
     }
 
     // ============ States ============
@@ -332,12 +384,8 @@ impl Store {
 
     pub fn insert_state(&mut self, root: H256, state: State) {
         let mut batch = self.backend.begin_write().expect("write batch");
-        batch
-            .put_batch(
-                Table::States,
-                vec![(root.as_ssz_bytes(), state.as_ssz_bytes())],
-            )
-            .expect("put state");
+        let entries = vec![(root.as_ssz_bytes(), state.as_ssz_bytes())];
+        batch.put_batch(Table::States, entries).expect("put state");
         batch.commit().expect("commit");
     }
 
@@ -368,11 +416,9 @@ impl Store {
 
     pub fn insert_known_attestation(&mut self, validator_id: u64, data: AttestationData) {
         let mut batch = self.backend.begin_write().expect("write batch");
+        let entries = vec![(validator_id.as_ssz_bytes(), data.as_ssz_bytes())];
         batch
-            .put_batch(
-                Table::LatestKnownAttestations,
-                vec![(validator_id.as_ssz_bytes(), data.as_ssz_bytes())],
-            )
+            .put_batch(Table::LatestKnownAttestations, entries)
             .expect("put attestation");
         batch.commit().expect("commit");
     }
@@ -404,11 +450,9 @@ impl Store {
 
     pub fn insert_new_attestation(&mut self, validator_id: u64, data: AttestationData) {
         let mut batch = self.backend.begin_write().expect("write batch");
+        let entries = vec![(validator_id.as_ssz_bytes(), data.as_ssz_bytes())];
         batch
-            .put_batch(
-                Table::LatestNewAttestations,
-                vec![(validator_id.as_ssz_bytes(), data.as_ssz_bytes())],
-            )
+            .put_batch(Table::LatestNewAttestations, entries)
             .expect("put attestation");
         batch.commit().expect("commit");
     }
@@ -492,11 +536,9 @@ impl Store {
 
     pub fn insert_gossip_signature(&mut self, key: SignatureKey, signature: ValidatorSignature) {
         let mut batch = self.backend.begin_write().expect("write batch");
+        let entries = vec![(encode_signature_key(&key), signature.to_bytes())];
         batch
-            .put_batch(
-                Table::GossipSignatures,
-                vec![(encode_signature_key(&key), signature.to_bytes())],
-            )
+            .put_batch(Table::GossipSignatures, entries)
             .expect("put signature");
         batch.commit().expect("commit");
     }
@@ -540,11 +582,9 @@ impl Store {
         proofs.push(proof);
 
         let mut batch = self.backend.begin_write().expect("write batch");
+        let entries = vec![(encode_signature_key(&key), proofs.as_ssz_bytes())];
         batch
-            .put_batch(
-                Table::AggregatedPayloads,
-                vec![(encode_signature_key(&key), proofs.as_ssz_bytes())],
-            )
+            .put_batch(Table::AggregatedPayloads, entries)
             .expect("put proofs");
         batch.commit().expect("commit");
     }
