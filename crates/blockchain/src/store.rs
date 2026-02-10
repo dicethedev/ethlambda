@@ -144,7 +144,6 @@ fn aggregate_committee_signatures(store: &mut Store) {
                 .entry(*data_root)
                 .or_default()
                 .push((*validator_id, sig));
-            keys_to_delete.push((*validator_id, *data_root));
         }
     }
 
@@ -161,7 +160,10 @@ fn aggregate_committee_signatures(store: &mut Store) {
         let mut ids = vec![];
 
         for (vid, sig) in &validators_and_sigs {
-            let Ok(pubkey) = validators[*vid as usize].get_pubkey() else {
+            let Some(validator) = validators.get(*vid as usize) else {
+                continue;
+            };
+            let Ok(pubkey) = validator.get_pubkey() else {
                 continue;
             };
             sigs.push(sig.clone());
@@ -187,6 +189,9 @@ fn aggregate_committee_signatures(store: &mut Store) {
         for vid in &ids {
             store.insert_new_aggregated_payload((*vid, data_root), payload.clone());
         }
+
+        // Only delete successfully aggregated signatures
+        keys_to_delete.extend(ids.iter().map(|vid| (*vid, data_root)));
 
         metrics::inc_pq_sig_aggregated_signatures();
         metrics::inc_pq_sig_attestations_in_aggregated_signatures(ids.len() as u64);
@@ -257,7 +262,7 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
 ///   interval = store.time() % INTERVALS_PER_SLOT
 pub fn on_tick(store: &mut Store, timestamp: u64, has_proposal: bool, is_aggregator: bool) {
     // Convert UNIX timestamp to interval count since genesis
-    let time_delta_ms = (timestamp - store.config().genesis_time) * 1000;
+    let time_delta_ms = timestamp.saturating_sub(store.config().genesis_time) * 1000;
     let time = time_delta_ms / MILLISECONDS_PER_INTERVAL;
 
     // If we're more than a slot behind, fast-forward to a slot before.
@@ -324,15 +329,6 @@ pub fn on_gossip_attestation(
     };
     validate_attestation_data(store, &attestation.data)
         .inspect_err(|_| metrics::inc_attestations_invalid("gossip"))?;
-
-    // Reject attestations from future slots
-    let current_slot = store.time() / INTERVALS_PER_SLOT;
-    if attestation.data.slot > current_slot {
-        return Err(StoreError::AttestationTooFarInFuture {
-            attestation_slot: attestation.data.slot,
-            current_slot,
-        });
-    }
 
     let target = attestation.data.target;
     let target_state = store
@@ -406,13 +402,38 @@ pub fn on_gossip_aggregated_attestation(
     validate_attestation_data(store, &aggregated.data)
         .inspect_err(|_| metrics::inc_attestations_invalid("aggregated"))?;
 
-    // Reject attestations from future slots
-    let current_slot = store.time() / INTERVALS_PER_SLOT;
-    if aggregated.data.slot > current_slot {
-        return Err(StoreError::AttestationTooFarInFuture {
-            attestation_slot: aggregated.data.slot,
-            current_slot,
-        });
+    // Verify aggregated proof signature
+    if cfg!(not(feature = "skip-signature-verification")) {
+        let target_state = store
+            .get_state(&aggregated.data.target.root)
+            .ok_or(StoreError::MissingTargetState(aggregated.data.target.root))?;
+        let validators = &target_state.validators;
+        let num_validators = validators.len() as u64;
+
+        let participant_indices: Vec<u64> = aggregated.proof.participant_indices().collect();
+        if participant_indices.iter().any(|&vid| vid >= num_validators) {
+            return Err(StoreError::InvalidValidatorIndex);
+        }
+
+        let pubkeys: Vec<_> = participant_indices
+            .iter()
+            .map(|&vid| {
+                validators[vid as usize]
+                    .get_pubkey()
+                    .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
+            })
+            .collect::<Result<_, _>>()?;
+
+        let message = aggregated.data.tree_hash_root();
+        let epoch: u32 = aggregated.data.slot.try_into().expect("slot exceeds u32");
+
+        ethlambda_crypto::verify_aggregated_signature(
+            &aggregated.proof.proof_data,
+            pubkeys,
+            &message,
+            epoch,
+        )
+        .map_err(StoreError::AggregateVerificationFailed)?;
     }
 
     // Store attestation data by root (content-addressed, idempotent)
