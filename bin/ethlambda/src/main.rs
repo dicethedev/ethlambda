@@ -230,9 +230,13 @@ async fn main() -> eyre::Result<()> {
     tokio::spawn(async move {
         // This can be turned into a loop
         tokio::signal::ctrl_c().await.ok();
-        warn!("Graceful shutdown in progress. Press ctrl+C 2 more times to force ungraceful shutdown");
+        warn!(
+            "Graceful shutdown in progress. Press ctrl+C 2 more times to force ungraceful shutdown"
+        );
         tokio::signal::ctrl_c().await.ok();
-        warn!("Graceful shutdown in progress. Press ctrl+C 1 more times to force ungraceful shutdown");
+        warn!(
+            "Graceful shutdown in progress. Press ctrl+C 1 more times to force ungraceful shutdown"
+        );
         tokio::signal::ctrl_c().await.ok();
         info!("Forced ungraceful shutdown...");
         std::process::exit(1);
