@@ -649,7 +649,7 @@
     });
 
     container.addEventListener("wheel", markUserScrollIntent, { passive: true });
-    container.addEventListener("pointerdown", markUserScrollIntent);
+    container.addEventListener("pointerdown", markUserScrollIntent, { passive: true });
     container.addEventListener("touchstart", markUserScrollIntent, { passive: true });
     window.addEventListener("keydown", event => {
       if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) {
