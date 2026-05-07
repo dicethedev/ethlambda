@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ethlambda_storage::Store;
 use libp2p::{PeerId, request_response};
@@ -12,11 +12,13 @@ use ethlambda_types::primitives::HashTreeRoot as _;
 use ethlambda_types::{block::SignedBlock, primitives::H256};
 
 use super::{
-    BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, Request, Response, ResponsePayload, Status,
+    BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRangeRequest, BlocksByRootRequest, MAX_REQUEST_BLOCKS,
+    Request, Response, ResponsePayload, Status, messages::error_message,
 };
 use crate::{
     BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, P2PServer, PendingRequest,
-    p2p_protocol, req_resp::RequestedBlockRoots,
+    p2p_protocol,
+    req_resp::{RequestedBlockRoots, messages::ResponseCode},
 };
 
 pub async fn handle_req_resp_message(
@@ -42,6 +44,13 @@ pub async fn handle_req_resp_message(
                         );
                         handle_blocks_by_root_request(server, request, channel, peer).await;
                     }
+                    Request::BlocksByRange(request) => {
+                        info!(
+                            kind = "blocks_by_range_request",
+                            peer_count, "P2P message received"
+                        );
+                        handle_blocks_by_range_request(server, request, channel, peer).await;
+                    }
                 }
             }
             request_response::Message::Response {
@@ -62,6 +71,14 @@ pub async fn handle_req_resp_message(
                             );
                             handle_blocks_by_root_response(server, blocks, peer, request_id, ctx)
                                 .await;
+                        }
+                        ResponsePayload::BlocksByRange(blocks) => {
+                            info!(
+                                kind = "blocks_by_range_response",
+                                peer_count,
+                                count = blocks.len(),
+                                "P2P message received"
+                            );
                         }
                     },
                     Response::Error { code, message } => {
@@ -138,6 +155,97 @@ async fn handle_blocks_by_root_request(
 
     let response = Response::success(ResponsePayload::BlocksByRoot(blocks));
     server.swarm_handle.send_response(channel, response);
+}
+
+async fn handle_blocks_by_range_request(
+    server: &mut P2PServer,
+    request: BlocksByRangeRequest,
+    channel: request_response::ResponseChannel<Response>,
+    peer: PeerId,
+) {
+    info!(
+        %peer,
+        start_slot = request.start_slot,
+        count = request.count,
+        step = request.step,
+        "Received BlocksByRange request"
+    );
+
+    if request.step == 0 || request.count > MAX_REQUEST_BLOCKS {
+        let response = Response::error(
+            ResponseCode::INVALID_REQUEST,
+            error_message("invalid BlocksByRange request"),
+        );
+        server.swarm_handle.send_response(channel, response);
+        return;
+    }
+
+    let blocks = canonical_blocks_by_range(
+        &server.store,
+        request.start_slot,
+        request.count,
+        request.step,
+    );
+
+    info!(
+        %peer,
+        start_slot = request.start_slot,
+        count = request.count,
+        step = request.step,
+        found = blocks.len(),
+        "Responding to BlocksByRange request"
+    );
+
+    let response = Response::success(ResponsePayload::BlocksByRange(blocks));
+    server.swarm_handle.send_response(channel, response);
+}
+
+fn canonical_blocks_by_range(
+    store: &Store,
+    start_slot: u64,
+    count: u64,
+    step: u64,
+) -> Vec<SignedBlock> {
+    if count == 0 {
+        return Vec::new();
+    }
+
+    let Some(last_offset) = count
+        .checked_sub(1)
+        .and_then(|value| value.checked_mul(step))
+    else {
+        return Vec::new();
+    };
+    let Some(end_slot) = start_slot.checked_add(last_offset) else {
+        return Vec::new();
+    };
+
+    let mut roots_by_slot = HashMap::new();
+    let mut current_root = store.head();
+
+    while !current_root.is_zero() {
+        let Some(header) = store.get_block_header(&current_root) else {
+            break;
+        };
+
+        if header.slot < start_slot {
+            break;
+        }
+
+        if header.slot <= end_slot && (header.slot - start_slot) % step == 0 {
+            roots_by_slot.insert(header.slot, current_root);
+        }
+
+        current_root = header.parent_root;
+    }
+
+    (0..count)
+        .filter_map(|index| {
+            let slot = start_slot.checked_add(index.checked_mul(step)?)?;
+            let root = roots_by_slot.get(&slot)?;
+            store.get_signed_block(root)
+        })
+        .collect()
 }
 
 async fn handle_blocks_by_root_response(
@@ -312,4 +420,68 @@ async fn handle_fetch_failure(
     pending.attempts += 1;
 
     send_after(backoff, ctx.clone(), p2p_protocol::RetryBlockFetch { root });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethlambda_storage::{ForkCheckpoints, backend::InMemoryBackend};
+    use ethlambda_types::{
+        attestation::XmssSignature,
+        block::{Block, BlockBody, BlockSignatures},
+        signature::SIGNATURE_SIZE,
+        state::State,
+    };
+    use libssz_types::SszList;
+    use std::sync::Arc;
+
+    fn signed_block(slot: u64, parent_root: H256) -> SignedBlock {
+        SignedBlock {
+            message: Block {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: H256::ZERO,
+                body: BlockBody::default(),
+            },
+            signature: BlockSignatures {
+                attestation_signatures: SszList::new(),
+                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
+            },
+        }
+    }
+
+    #[test]
+    fn blocks_by_range_returns_canonical_blocks_in_requested_order() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(backend, State::from_genesis(0, vec![]));
+
+        let block_1 = signed_block(1, store.head());
+        let root_1 = block_1.message.hash_tree_root();
+        store.insert_signed_block(root_1, block_1);
+
+        let block_2 = signed_block(2, root_1);
+        let root_2 = block_2.message.hash_tree_root();
+        store.insert_signed_block(root_2, block_2);
+
+        let side_block_3 = signed_block(3, root_1);
+        let side_root_3 = side_block_3.message.hash_tree_root();
+        store.insert_signed_block(side_root_3, side_block_3);
+
+        let block_4 = signed_block(4, root_2);
+        let root_4 = block_4.message.hash_tree_root();
+        store.insert_signed_block(root_4, block_4);
+        store.update_checkpoints(ForkCheckpoints::head_only(root_4));
+
+        let blocks = canonical_blocks_by_range(&store, 1, 4, 1);
+        let slots: Vec<_> = blocks.iter().map(|block| block.message.slot).collect();
+        let roots: Vec<_> = blocks
+            .iter()
+            .map(|block| block.message.hash_tree_root())
+            .collect();
+
+        assert_eq!(slots, vec![1, 2, 4]);
+        assert_eq!(roots, vec![root_1, root_2, root_4]);
+        assert!(!roots.contains(&side_root_3));
+    }
 }

@@ -7,8 +7,8 @@ use tracing::{debug, trace, warn};
 use super::{
     encoding::{MAX_PAYLOAD_SIZE, decode_payload, write_payload},
     messages::{
-        BLOCKS_BY_ROOT_PROTOCOL_V1, ErrorMessage, Request, Response, ResponseCode, ResponsePayload,
-        STATUS_PROTOCOL_V1, Status,
+        BLOCKS_BY_RANGE_PROTOCOL_V1, BLOCKS_BY_ROOT_PROTOCOL_V1, ErrorMessage, Request, Response,
+        ResponseCode, ResponsePayload, STATUS_PROTOCOL_V1, Status,
     },
 };
 
@@ -45,6 +45,12 @@ impl libp2p::request_response::Codec for Codec {
                 })?;
                 Ok(Request::BlocksByRoot(request))
             }
+            BLOCKS_BY_RANGE_PROTOCOL_V1 => {
+                let request = SszDecode::from_ssz_bytes(&payload).map_err(|err| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
+                })?;
+                Ok(Request::BlocksByRange(request))
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown protocol: {}", protocol.as_ref()),
@@ -63,6 +69,7 @@ impl libp2p::request_response::Codec for Codec {
         match protocol.as_ref() {
             STATUS_PROTOCOL_V1 => decode_status_response(io).await,
             BLOCKS_BY_ROOT_PROTOCOL_V1 => decode_blocks_by_root_response(io).await,
+            BLOCKS_BY_RANGE_PROTOCOL_V1 => decode_blocks_by_range_response(io).await,
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown protocol: {}", protocol.as_ref()),
@@ -84,6 +91,7 @@ impl libp2p::request_response::Codec for Codec {
         let encoded = match req {
             Request::Status(status) => status.to_ssz(),
             Request::BlocksByRoot(request) => request.to_ssz(),
+            Request::BlocksByRange(request) => request.to_ssz(),
         };
 
         write_payload(io, &encoded).await
@@ -107,7 +115,8 @@ impl libp2p::request_response::Codec for Codec {
                         let encoded = status.to_ssz();
                         write_payload(io, &encoded).await
                     }
-                    ResponsePayload::BlocksByRoot(blocks) => {
+                    ResponsePayload::BlocksByRoot(blocks)
+                    | ResponsePayload::BlocksByRange(blocks) => {
                         // Write each block as a separate chunk.
                         // Encode first, then check size before writing the SUCCESS
                         // code byte. This avoids corrupting the stream if a block
@@ -118,7 +127,7 @@ impl libp2p::request_response::Codec for Codec {
                             if encoded.len() > MAX_PAYLOAD_SIZE - 1024 {
                                 warn!(
                                     size = encoded.len(),
-                                    "Skipping oversized block in BlocksByRoot response"
+                                    "Skipping oversized block in block response"
                                 );
                                 continue;
                             }
@@ -219,6 +228,23 @@ async fn decode_blocks_by_root_response<T>(io: &mut T) -> io::Result<Response>
 where
     T: AsyncRead + Unpin + Send,
 {
+    decode_blocks_response(io, ResponsePayload::BlocksByRoot).await
+}
+
+async fn decode_blocks_by_range_response<T>(io: &mut T) -> io::Result<Response>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    decode_blocks_response(io, ResponsePayload::BlocksByRange).await
+}
+
+async fn decode_blocks_response<T>(
+    io: &mut T,
+    payload: fn(Vec<SignedBlock>) -> ResponsePayload,
+) -> io::Result<Response>
+where
+    T: AsyncRead + Unpin + Send,
+{
     let mut blocks = Vec::new();
 
     loop {
@@ -247,5 +273,5 @@ where
         blocks.push(block);
     }
 
-    Ok(Response::success(ResponsePayload::BlocksByRoot(blocks)))
+    Ok(Response::success(payload(blocks)))
 }
