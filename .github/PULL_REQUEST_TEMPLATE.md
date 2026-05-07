@@ -21,8 +21,6 @@
 
 ## ✅ Verification Checklist
 
-- [ ] Ran `cargo fmt --check`
-- [ ] Ran `cargo fmt`
-- [ ] Ran `cargo check`
-- [ ] Ran relevant tests
-- [ ] Verified no diff issues with `git diff --check`
+- [ ] `make fmt` — clean
+- [ ] `make lint` (clippy with `-D warnings`) — clean
+- [ ] `cargo test --workspace --release` — all passing
