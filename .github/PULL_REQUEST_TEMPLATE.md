@@ -1,5 +1,3 @@
-# Pull Request Template
-
 ## 🗒️ Description / Motivation
 - What does this PR change?
 - Why is this change needed?
