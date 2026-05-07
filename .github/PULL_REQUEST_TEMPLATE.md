@@ -18,3 +18,11 @@
 ## Related Issues / PRs
 - Closes #
 - Related to #
+
+## ✅ Verification Checklist
+
+- [ ] Ran `cargo fmt --check`
+- [ ] Ran `cargo fmt`
+- [ ] Ran `cargo check`
+- [ ] Ran relevant tests
+- [ ] Verified no diff issues with `git diff --check`
