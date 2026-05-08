@@ -329,6 +329,7 @@ async fn handle_blocks_by_range_response(
         for block in blocks {
             let block_root = block.message.hash_tree_root();
             let slot = block.message.slot;
+            // TODO: validate block.message.slot is within the originally requested range.
             let _ = blockchain.new_block(block).inspect_err(|err| {
                 error!(
                     %peer,
