@@ -16,10 +16,9 @@ use super::{
     BLOCKS_BY_RANGE_PROTOCOL_V1, BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRangeRequest,
     BlocksByRootRequest, MAX_REQUEST_BLOCKS, Request, Response, ResponsePayload, Status,
 };
-use crate::LONG_RANGE_SYNC_THRESHOLD;
 use crate::{
-    BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, P2PServer, PendingRequest,
-    p2p_protocol, req_resp::RequestedBlockRoots,
+    BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, LONG_RANGE_SYNC_THRESHOLD, MAX_FETCH_RETRIES,
+    MAX_SYNC_RANGE, P2PServer, PendingRequest, p2p_protocol, req_resp::RequestedBlockRoots,
 };
 
 pub async fn handle_req_resp_message(
@@ -143,8 +142,10 @@ async fn handle_status_response(server: &mut P2PServer, status: Status, peer: Pe
     if gap > LONG_RANGE_SYNC_THRESHOLD {
         // Long-range sync: request blocks by range to efficiently fill large gap.
         let start_slot = our_head_slot.saturating_add(1);
+        // Cap the range to avoid requesting an excessive number of blocks if the peer is very far ahead.
+        let count = gap.min(MAX_SYNC_RANGE);
         info!(%peer, start_slot, gap, "Long-range sync: using BlocksByRange");
-        request_blocks_by_range_from_peer(server, peer, start_slot, gap).await;
+        request_blocks_by_range_from_peer(server, peer, start_slot, count).await;
     } else {
         // Short-range sync: fetch individual blocks by root, relying on gossip to fill any small gaps.
         info!(%peer, gap, "Short gap, relying on gossip / FetchBlock for missing slots");

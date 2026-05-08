@@ -41,7 +41,7 @@ use crate::{
     },
     req_resp::{
         BLOCKS_BY_RANGE_PROTOCOL_V1, BLOCKS_BY_ROOT_PROTOCOL_V1, Codec,
-        MAX_COMPRESSED_PAYLOAD_SIZE, Request, STATUS_PROTOCOL_V1, build_status,
+        MAX_COMPRESSED_PAYLOAD_SIZE, MAX_REQUEST_BLOCKS, Request, STATUS_PROTOCOL_V1, build_status,
         fetch_block_from_peer,
     },
     swarm_adapter::SwarmHandle,
@@ -60,6 +60,7 @@ const INITIAL_BACKOFF_MS: u64 = 5;
 const BACKOFF_MULTIPLIER: u64 = 2;
 const PEER_REDIAL_INTERVAL_SECS: u64 = 12;
 pub const LONG_RANGE_SYNC_THRESHOLD: u64 = 2;
+const MAX_SYNC_RANGE: u64 = MAX_REQUEST_BLOCKS * 64; // 65,536 slots (~3 days)
 
 pub(crate) struct PendingRequest {
     pub(crate) attempts: u32,
