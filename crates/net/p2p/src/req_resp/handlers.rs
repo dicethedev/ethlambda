@@ -18,7 +18,8 @@ use super::{
 };
 use crate::{
     BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, LONG_RANGE_SYNC_THRESHOLD, MAX_FETCH_RETRIES,
-    MAX_SYNC_RANGE, P2PServer, PendingRequest, p2p_protocol, req_resp::RequestedBlockRoots,
+    MAX_SLOT_LOOKBACK, MAX_SYNC_RANGE, P2PServer, PendingRequest, p2p_protocol,
+    req_resp::RequestedBlockRoots,
 };
 
 pub async fn handle_req_resp_message(
@@ -238,6 +239,12 @@ fn canonical_blocks_by_range(
     let Some(end_slot) = start_slot.checked_add(last_offset) else {
         return Vec::new();
     };
+
+    // Avoid expensive lookups if the requested range is too far in the past (beyond recent gossip history).
+    let head_slot = store.head_slot();
+    if head_slot.saturating_sub(end_slot) > MAX_SLOT_LOOKBACK {
+        return Vec::new();
+    }
 
     let mut roots_by_slot = HashMap::new();
     let mut current_root = store.head();

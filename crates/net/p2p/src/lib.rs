@@ -59,8 +59,9 @@ const MAX_FETCH_RETRIES: u32 = 10;
 const INITIAL_BACKOFF_MS: u64 = 5;
 const BACKOFF_MULTIPLIER: u64 = 2;
 const PEER_REDIAL_INTERVAL_SECS: u64 = 12;
-pub const LONG_RANGE_SYNC_THRESHOLD: u64 = 2;
+const LONG_RANGE_SYNC_THRESHOLD: u64 = 2;
 const MAX_SYNC_RANGE: u64 = MAX_REQUEST_BLOCKS * 64; // 65,536 slots (~3 days)
+const MAX_SLOT_LOOKBACK: u64 = MAX_REQUEST_BLOCKS * 4; // 4 096 slots
 
 pub(crate) struct PendingRequest {
     pub(crate) attempts: u32,
