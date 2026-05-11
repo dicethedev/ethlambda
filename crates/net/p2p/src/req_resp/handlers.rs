@@ -210,13 +210,10 @@ fn canonical_blocks_by_range(
         return Vec::new();
     }
 
-    let Some(last_offset) = count
+    let Some(end_slot) = count
         .checked_sub(1)
         .and_then(|value| value.checked_mul(step))
-    else {
-        return Vec::new();
-    };
-    let Some(end_slot) = start_slot.checked_add(last_offset) else {
+        .and_then(|last_offset| start_slot.checked_add(last_offset)) else {
         return Vec::new();
     };
 
