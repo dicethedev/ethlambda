@@ -21,6 +21,7 @@ fn protocol_label(protocol: &str) -> &'static str {
     match protocol {
         STATUS_PROTOCOL_V1 => "status",
         BLOCKS_BY_ROOT_PROTOCOL_V1 => "blocks_by_root",
+        BLOCKS_BY_RANGE_PROTOCOL_V1 => "blocks_by_range",
         _ => "unknown",
     }
 }
@@ -82,11 +83,10 @@ impl libp2p::request_response::Codec for Codec {
     {
         let label = protocol_label(protocol.as_ref());
         match protocol.as_ref() {
-            STATUS_PROTOCOL_V1 => decode_status_response(io).await,
-            BLOCKS_BY_ROOT_PROTOCOL_V1 => decode_blocks_by_root_response(io).await,
-            BLOCKS_BY_RANGE_PROTOCOL_V1 => decode_blocks_by_range_response(io).await,
             STATUS_PROTOCOL_V1 => decode_status_response(io, label).await,
-            BLOCKS_BY_ROOT_PROTOCOL_V1 => decode_blocks_by_root_response(io, label).await,
+            BLOCKS_BY_ROOT_PROTOCOL_V1 | BLOCKS_BY_RANGE_PROTOCOL_V1 => {
+                decode_blocks_response(io, label).await
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown protocol: {}", protocol.as_ref()),
@@ -142,8 +142,7 @@ impl libp2p::request_response::Codec for Codec {
                         );
                         Ok(())
                     }
-                    ResponsePayload::BlocksByRoot(blocks)
-                    | ResponsePayload::BlocksByRange(blocks) => {
+                    ResponsePayload::Blocks(blocks) => {
                         // Write each block as a separate chunk.
                         // Encode first, then check size before writing the SUCCESS
                         // code byte. This avoids corrupting the stream if a block
@@ -241,7 +240,7 @@ where
     Ok(Response::success(ResponsePayload::Status(status)))
 }
 
-/// Decodes a BlocksByRoot protocol response from a multi-chunk response stream.
+/// Decodes a block protocol response from a multi-chunk response stream.
 ///
 /// Reads chunks until EOF, collecting successfully decoded blocks. Each chunk has
 /// its own response code - chunks with error codes are logged and skipped rather
@@ -264,24 +263,7 @@ where
 ///
 /// Note: Error chunks from the peer (non-SUCCESS response codes) do not cause this
 /// function to return `Err` - they are logged and skipped.
-async fn decode_blocks_by_root_response<T>(io: &mut T, protocol_label: &str) -> io::Result<Response>
-where
-    T: AsyncRead + Unpin + Send,
-{
-    decode_blocks_response(io, ResponsePayload::BlocksByRoot).await
-}
-
-async fn decode_blocks_by_range_response<T>(io: &mut T) -> io::Result<Response>
-where
-    T: AsyncRead + Unpin + Send,
-{
-    decode_blocks_response(io, ResponsePayload::BlocksByRange).await
-}
-
-async fn decode_blocks_response<T>(
-    io: &mut T,
-    payload: fn(Vec<SignedBlock>) -> ResponsePayload,
-) -> io::Result<Response>
+async fn decode_blocks_response<T>(io: &mut T, protocol_label: &str) -> io::Result<Response>
 where
     T: AsyncRead + Unpin + Send,
 {
@@ -319,5 +301,5 @@ where
         blocks.push(block);
     }
 
-    Ok(Response::success(payload(blocks)))
+    Ok(Response::success(ResponsePayload::Blocks(blocks)))
 }
