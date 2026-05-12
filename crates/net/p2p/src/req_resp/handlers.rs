@@ -13,8 +13,9 @@ use ethlambda_types::{block::SignedBlock, primitives::H256};
 
 use super::messages::{ResponseCode, error_message};
 use super::{
-    BLOCKS_BY_RANGE_PROTOCOL_V1, BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRangeRequest,
-    BlocksByRootRequest, MAX_REQUEST_BLOCKS, Request, Response, ResponsePayload, Status,
+    BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRangeRequest, BlocksByRootRequest, MAX_REQUEST_BLOCKS,
+    Request, Response, ResponsePayload, Status,
+    messages::{ResponseCode, error_message},
 };
 use crate::{
     BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, LONG_RANGE_SYNC_THRESHOLD, MAX_FETCH_RETRIES,
@@ -65,11 +66,8 @@ pub async fn handle_req_resp_message(
                             info!(kind = "status_response", peer_count, "P2P message received");
                             handle_status_response(server, status, peer).await;
                         }
-                        ResponsePayload::BlocksByRoot(blocks) => {
-                            info!(
-                                kind = "blocks_by_root_response",
-                                peer_count, "P2P message received"
-                            );
+                        ResponsePayload::Blocks(blocks) => {
+                            info!(kind = "blocks_response", peer_count, "P2P message received");
                             handle_blocks_by_root_response(server, blocks, peer, request_id, ctx)
                                 .await;
                         }
@@ -173,7 +171,7 @@ async fn handle_blocks_by_root_request(
     let found = blocks.len();
     info!(%peer, num_roots, found, "Responding to BlocksByRoot request");
 
-    let response = Response::success(ResponsePayload::BlocksByRoot(blocks));
+    let response = Response::success(ResponsePayload::Blocks(blocks));
     server.swarm_handle.send_response(channel, response);
 }
 
@@ -216,7 +214,7 @@ async fn handle_blocks_by_range_request(
         "Responding to BlocksByRange request"
     );
 
-    let response = Response::success(ResponsePayload::BlocksByRange(blocks));
+    let response = Response::success(ResponsePayload::Blocks(blocks));
     server.swarm_handle.send_response(channel, response);
 }
 
@@ -230,16 +228,14 @@ fn canonical_blocks_by_range(
         return Vec::new();
     }
 
-    let Some(last_offset) = count
+    let Some(end_slot) = count
         .checked_sub(1)
         .and_then(|value| value.checked_mul(step))
+        .and_then(|last_offset| start_slot.checked_add(last_offset))
     else {
         return Vec::new();
     };
-    let Some(end_slot) = start_slot.checked_add(last_offset) else {
-        return Vec::new();
-    };
-
+  
     // Avoid expensive lookups if the requested range is too far in the past (beyond recent gossip history).
     let head_slot = store.head_slot();
     if head_slot.saturating_sub(end_slot) > MAX_SLOT_LOOKBACK {

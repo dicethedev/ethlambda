@@ -91,8 +91,7 @@ impl std::fmt::Debug for ResponseCode {
 #[allow(clippy::large_enum_variant)]
 pub enum ResponsePayload {
     Status(Status),
-    BlocksByRoot(Vec<SignedBlock>),
-    BlocksByRange(Vec<SignedBlock>),
+    Blocks(Vec<SignedBlock>),
 }
 
 #[derive(Debug, Clone, SszEncode, SszDecode)]
