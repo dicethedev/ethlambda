@@ -150,7 +150,6 @@ jobs:
   docker_build:
     name: Build Docker
     runs-on: ubuntu-latest
-    if: ${{ needs.detect-changes.outputs.run_tests == 'true' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -173,7 +172,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Upload image artifact
+      - name: Upload image artifacts
         uses: actions/upload-artifact@v6
         with:
           name: ethlambda_image
@@ -255,7 +254,7 @@ jobs:
           hive_repository: ethereum/hive
           hive_version: 6f704d0cd8fb4dfd3f635abcc5a3ea6cd395e61b
           simulator: lean
-          client: ethlambda_devnet4
+          client: ethlambda
           client_config: ${{ steps.client-config.outputs.config }}
           extra_flags: ${{ steps.hive-flags.outputs.flags }}
 
