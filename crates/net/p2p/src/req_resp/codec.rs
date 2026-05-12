@@ -267,27 +267,6 @@ async fn decode_blocks_response<T>(io: &mut T, protocol_label: &str) -> io::Resu
 where
     T: AsyncRead + Unpin + Send,
 {
-    decode_blocks_response(io, protocol_label, ResponsePayload::BlocksByRoot).await
-}
-
-async fn decode_blocks_by_range_response<T>(
-    io: &mut T,
-    protocol_label: &str,
-) -> io::Result<Response>
-where
-    T: AsyncRead + Unpin + Send,
-{
-    decode_blocks_response(io, protocol_label, ResponsePayload::BlocksByRange).await
-}
-
-async fn decode_blocks_response<T>(
-    io: &mut T,
-    protocol_label: &str,
-    payload: fn(Vec<SignedBlock>) -> ResponsePayload,
-) -> io::Result<Response>
-where
-    T: AsyncRead + Unpin + Send,
-{
     let mut blocks = Vec::new();
 
     loop {

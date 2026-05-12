@@ -11,10 +11,9 @@ use ethlambda_types::checkpoint::Checkpoint;
 use ethlambda_types::primitives::HashTreeRoot as _;
 use ethlambda_types::{block::SignedBlock, primitives::H256};
 
-use super::messages::{ResponseCode, error_message};
 use super::{
-    BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRangeRequest, BlocksByRootRequest, MAX_REQUEST_BLOCKS,
-    Request, Response, ResponsePayload, Status,
+    BLOCKS_BY_RANGE_PROTOCOL_V1, BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRangeRequest,
+    BlocksByRootRequest, MAX_REQUEST_BLOCKS, Request, Response, ResponsePayload, Status,
     messages::{ResponseCode, error_message},
 };
 use crate::{
@@ -68,17 +67,14 @@ pub async fn handle_req_resp_message(
                         }
                         ResponsePayload::Blocks(blocks) => {
                             info!(kind = "blocks_response", peer_count, "P2P message received");
-                            handle_blocks_by_root_response(server, blocks, peer, request_id, ctx)
+                            if server.range_request_ids.remove(&request_id) {
+                                handle_blocks_by_range_response(server, blocks, peer).await;
+                            } else {
+                                handle_blocks_by_root_response(
+                                    server, blocks, peer, request_id, ctx,
+                                )
                                 .await;
-                        }
-                        ResponsePayload::BlocksByRange(blocks) => {
-                            info!(
-                                kind = "blocks_by_range_response",
-                                peer_count,
-                                count = blocks.len(),
-                                "P2P message received"
-                            );
-                            handle_blocks_by_range_response(server, blocks, peer).await;
+                            }
                         }
                     },
                     Response::Error { code, message } => {
@@ -99,6 +95,8 @@ pub async fn handle_req_resp_message(
             // Check if this was a block fetch request
             if let Some(root) = server.request_id_map.remove(&request_id) {
                 handle_fetch_failure(server, root, peer, ctx).await;
+            } else if server.range_request_ids.remove(&request_id) {
+                warn!(%peer, ?request_id, "BlocksByRange request failed");
             }
         }
         request_response::Event::InboundFailure {
@@ -235,7 +233,7 @@ fn canonical_blocks_by_range(
     else {
         return Vec::new();
     };
-  
+
     // Avoid expensive lookups if the requested range is too far in the past (beyond recent gossip history).
     let head_slot = store.head_slot();
     if head_slot.saturating_sub(end_slot) > MAX_SLOT_LOOKBACK {
@@ -473,7 +471,7 @@ async fn request_blocks_by_range_from_peer(
             "Sending BlocksByRange request"
         );
 
-        if server
+        let Some(request_id) = server
             .swarm_handle
             .send_request(
                 peer,
@@ -481,8 +479,7 @@ async fn request_blocks_by_range_from_peer(
                 libp2p::StreamProtocol::new(BLOCKS_BY_RANGE_PROTOCOL_V1),
             )
             .await
-            .is_none()
-        {
+        else {
             warn!(
                 %peer,
                 start_slot = next_slot,
@@ -490,7 +487,9 @@ async fn request_blocks_by_range_from_peer(
                 "Failed to send BlocksByRange request (swarm adapter closed)"
             );
             return false;
-        }
+        };
+
+        server.range_request_ids.insert(request_id);
 
         remaining -= batch_count;
         next_slot = next_slot.saturating_add(batch_count);
