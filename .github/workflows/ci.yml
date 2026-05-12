@@ -255,7 +255,7 @@ jobs:
           hive_repository: ethereum/hive
           hive_version: 6f704d0cd8fb4dfd3f635abcc5a3ea6cd395e61b
           simulator: lean
-          client: ethlambda
+          client: ethlambda_devnet4
           client_config: ${{ steps.client-config.outputs.config }}
           extra_flags: ${{ steps.hive-flags.outputs.flags }}
 
