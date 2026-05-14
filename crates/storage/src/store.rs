@@ -20,7 +20,21 @@ use ethlambda_types::{
     state::{ChainConfig, State, anchor_pair_is_consistent},
 };
 use libssz::{SszDecode, SszEncode};
+use thiserror::Error;
 use tracing::info;
+
+/// Errors returned by [`Store::get_forkchoice_store`].
+#[derive(Debug, Error)]
+pub enum GetForkchoiceStoreError {
+    #[error(
+        "anchor block doesn't match anchor state: \
+         state header = {anchor_state:?}, block = {anchor_block:?}"
+    )]
+    AnchorPairInconsistent {
+        anchor_state: Box<State>,
+        anchor_block: Box<Block>,
+    },
+}
 
 /// Checkpoints to update in the forkchoice store.
 ///
@@ -470,20 +484,28 @@ impl Store {
     /// The block must match the state's `latest_block_header`.
     /// Named to mirror the spec's `get_forkchoice_store` function.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if [`anchor_pair_is_consistent`] would reject the pair.
+    /// Returns [`GetForkchoiceStoreError::AnchorPairInconsistent`] if the block's header
+    /// doesn't match the state's `latest_block_header` (comparing all fields
+    /// except `state_root`, which is computed internally).
     pub fn get_forkchoice_store(
         backend: Arc<dyn StorageBackend>,
         mut anchor_state: State,
         anchor_block: Block,
-    ) -> Self {
-        assert!(
-            anchor_pair_is_consistent(&mut anchor_state, &anchor_block),
-            "anchor block does not match anchor state"
-        );
+    ) -> Result<Self, GetForkchoiceStoreError> {
+        if !anchor_pair_is_consistent(&mut anchor_state, &anchor_block) {
+            return Err(GetForkchoiceStoreError::AnchorPairInconsistent {
+                anchor_state: Box::new(anchor_state),
+                anchor_block: Box::new(anchor_block),
+            });
+        }
 
-        Self::init_store(backend, anchor_state, Some(anchor_block.body))
+        Ok(Self::init_store(
+            backend,
+            anchor_state,
+            Some(anchor_block.body),
+        ))
     }
 
     /// Internal helper to initialize the store with anchor data.
