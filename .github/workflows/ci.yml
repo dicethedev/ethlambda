@@ -47,10 +47,16 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Get leanSpec fixtures SHA
+      - name: Get leanSpec fixtures release info
         id: fixtures-release
         run: |
-          sha=$(curl -L -f https://github.com/leanEthereum/leanSpec/releases/latest/download/fixtures-prod-scheme.tar.gz.sha256 | cut -d' ' -f1)
+          api_url="https://api.github.com/repos/leanEthereum/leanSpec/releases/latest"
+          json=$(curl -sL "$api_url")
+            fixtures_url=$(echo "$json" | python3 -c "import sys,json; j=json.load(sys.stdin); print(next(a.get('browser_download_url') for a in j.get('assets',[]) if a.get('name')=='fixtures-prod-scheme.tar.gz'))")
+            sha_url=$(echo "$json" | python3 -c "import sys,json; j=json.load(sys.stdin); print(next(a.get('browser_download_url') for a in j.get('assets',[]) if a.get('name')=='fixtures-prod-scheme.tar.gz.sha256'))")
+          sha=$(curl -sL "$sha_url" | cut -d' ' -f1)
+          echo "url=$fixtures_url" >> $GITHUB_OUTPUT
+          echo "sha_url=$sha_url" >> $GITHUB_OUTPUT
           echo "sha=$sha" >> $GITHUB_OUTPUT
 
       - name: Restore test fixtures cache
@@ -65,8 +71,8 @@ jobs:
         run: |
           tmpdir=$(mktemp -d)
           trap 'rm -rf "$tmpdir"' EXIT
-          fixtures_url="https://github.com/leanEthereum/leanSpec/releases/latest/download/fixtures-prod-scheme.tar.gz"
-          sha_url="$fixtures_url.sha256"
+          fixtures_url="${{ steps.fixtures-release.outputs.url }}"
+          sha_url="${{ steps.fixtures-release.outputs.sha_url }}"
           echo "Downloading fixtures from $fixtures_url"
           curl -L -f -o "$tmpdir/fixtures-prod-scheme.tar.gz" "$fixtures_url"
           curl -L -f -o "$tmpdir/fixtures-prod-scheme.tar.gz.sha256" "$sha_url"

@@ -37,7 +37,10 @@ leanSpec/fixtures:
 	curl -L -f -o "$$tmpdir/fixtures-prod-scheme.tar.gz.sha256" "$(LEAN_SPEC_FIXTURES_SHA_URL)"; \
 	expected=$$(cut -d' ' -f1 "$$tmpdir/fixtures-prod-scheme.tar.gz.sha256"); \
 	actual=$$(sha256sum "$$tmpdir/fixtures-prod-scheme.tar.gz" | awk '{print $$1}'); \
-	[ "$$expected" = "$$actual" ]; \
+	if [ "$$expected" != "$$actual" ]; then \
+		echo "SHA256 mismatch: expected $$expected, got $$actual" >&2; \
+		exit 1; \
+	fi; \
 	rm -rf leanSpec/fixtures; \
 	mkdir -p leanSpec/fixtures; \
 	tar -xzf "$$tmpdir/fixtures-prod-scheme.tar.gz" -C leanSpec/fixtures --strip-components=1
