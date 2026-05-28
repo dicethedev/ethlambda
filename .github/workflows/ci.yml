@@ -184,7 +184,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Upload image artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ethlambda_image
           path: /tmp/ethlambda_image.tar
@@ -279,7 +279,7 @@ jobs:
 
       - name: Upload Hive Failure Logs
         if: ${{ failure() && steps.verify-hive-results.conclusion == 'failure' }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: hive_failed_logs_${{ matrix.artifact_prefix }}
           path: src/results/failed_logs
