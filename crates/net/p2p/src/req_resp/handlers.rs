@@ -18,7 +18,7 @@ use super::{
 };
 use crate::{
     BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, MAX_SYNC_RANGE, P2PServer,
-    PendingRequest, p2p_protocol, req_resp::RequestedBlockRoots,
+    PendingRequest, PendingRequestKind, p2p_protocol, req_resp::RequestedBlockRoots,
 };
 
 pub async fn handle_req_resp_message(
@@ -66,13 +66,35 @@ pub async fn handle_req_resp_message(
                         }
                         ResponsePayload::Blocks(blocks) => {
                             info!(kind = "blocks_response", peer_count, "P2P message received");
-                            if server.range_request_ids.remove(&request_id) {
-                                handle_blocks_by_range_response(server, blocks, peer).await;
-                            } else {
-                                handle_blocks_by_root_response(
-                                    server, blocks, peer, request_id, ctx,
-                                )
-                                .await;
+
+                            match server.outbound_requests.remove(&request_id) {
+                                Some(PendingRequestKind::Range {
+                                    start_slot,
+                                    end_slot,
+                                    total_end_slot,
+                                }) => {
+                                    server
+                                        .pending_range_requests
+                                        .remove(&(start_slot, end_slot));
+                                    handle_blocks_by_range_response(
+                                        server,
+                                        blocks,
+                                        peer,
+                                        start_slot,
+                                        end_slot,
+                                        total_end_slot,
+                                    )
+                                    .await;
+                                }
+                                Some(PendingRequestKind::Root(root)) => {
+                                    handle_blocks_by_root_response(
+                                        server, blocks, peer, request_id, root, ctx,
+                                    )
+                                    .await;
+                                }
+                                None => {
+                                    warn!(%peer, ?request_id, "Received blocks response for unknown request_id");
+                                }
                             }
                         }
                     },
@@ -92,10 +114,29 @@ pub async fn handle_req_resp_message(
             warn!(%peer, ?request_id, %error, "Outbound request failed");
 
             // Check if this was a block fetch request
-            if let Some(root) = server.request_id_map.remove(&request_id) {
-                handle_fetch_failure(server, root, peer, ctx).await;
-            } else if server.range_request_ids.remove(&request_id) {
-                warn!(%peer, ?request_id, "BlocksByRange request failed");
+            match server.outbound_requests.remove(&request_id) {
+                Some(PendingRequestKind::Root(root)) => {
+                    handle_fetch_failure(server, root, peer, ctx).await;
+                }
+                Some(PendingRequestKind::Range {
+                    start_slot,
+                    end_slot,
+                    total_end_slot,
+                }) => {
+                    server
+                        .pending_range_requests
+                        .remove(&(start_slot, end_slot));
+                    send_after(
+                        Duration::from_millis(500),
+                        ctx.clone(),
+                        p2p_protocol::RetryRangeSync {
+                            peer_id: peer,
+                            start_slot,
+                            end_slot: total_end_slot, // retry the full remaining range
+                        },
+                    );
+                }
+                None => {}
             }
         }
         request_response::Event::InboundFailure {
@@ -134,9 +175,11 @@ async fn handle_status_response(server: &mut P2PServer, status: Status, peer: Pe
         return;
     }
     let gap = status.head.slot - our_head_slot;
-    let count = gap.min(MAX_SYNC_RANGE);
     let start_slot = our_head_slot.saturating_add(1);
-    request_blocks_by_range_from_peer(server, peer, start_slot, count).await;
+    let total_end_slot = start_slot
+        .saturating_add(gap.min(MAX_SYNC_RANGE))
+        .saturating_sub(1);
+    request_blocks_by_range_from_peer(server, peer, start_slot, total_end_slot).await;
     info!(%peer, start_slot, gap, "Long-range sync: using BlocksByRange");
 }
 
@@ -244,18 +287,16 @@ async fn handle_blocks_by_root_response(
     blocks: Vec<SignedBlock>,
     peer: PeerId,
     request_id: request_response::OutboundRequestId,
+    requested_root: H256,
     ctx: &Context<P2PServer>,
 ) {
     info!(%peer, count = blocks.len(), "Received BlocksByRoot response");
 
-    // Look up which root was requested for this specific request
-    let Some(requested_root) = server.request_id_map.remove(&request_id) else {
-        warn!(%peer, ?request_id, "Received response for unknown request_id");
-        return;
-    };
-
     if blocks.is_empty() {
-        server.request_id_map.insert(request_id, requested_root);
+        // Re-insert so failure handling can find it
+        server
+            .outbound_requests
+            .insert(request_id, PendingRequestKind::Root(requested_root));
         warn!(%peer, "Received empty BlocksByRoot response");
         handle_fetch_failure(server, requested_root, peer, ctx).await;
         return;
@@ -276,7 +317,7 @@ async fn handle_blocks_by_root_response(
         }
 
         // Clean up tracking for this root
-        server.pending_requests.remove(&root);
+        server.pending_root_requests.remove(&root);
 
         if let Some(ref blockchain) = server.blockchain {
             let _ = blockchain
@@ -290,29 +331,47 @@ async fn handle_blocks_by_range_response(
     server: &mut P2PServer,
     blocks: Vec<SignedBlock>,
     peer: PeerId,
+    start_slot: u64,
+    end_slot: u64,
+    total_end_slot: u64,
 ) {
+    server
+        .pending_range_requests
+        .remove(&(start_slot, end_slot));
+
     info!(%peer, count = blocks.len(), "Received BlocksByRange response");
 
     if blocks.is_empty() {
-        warn!(%peer, "Received empty BlocksByRange response");
+        warn!(%peer, start_slot, end_slot, "Received empty BlocksByRange response");
         return;
     }
 
-    if let Some(ref blockchain) = server.blockchain {
-        for block in blocks {
-            let block_root = block.message.hash_tree_root();
-            let slot = block.message.slot;
-            // TODO: validate block.message.slot is within the originally requested range.
-            let _ = blockchain.new_block(block).inspect_err(|err| {
-                error!(
-                    %peer,
-                    %slot,
-                    block_root = %ethlambda_types::ShortRoot(&block_root.0),
-                    %err,
-                    "Failed to forward range-fetched block to blockchain"
-                )
-            });
+    let Some(ref blockchain) = server.blockchain else {
+        warn!(%peer, "No blockchain handler available");
+        return;
+    };
+
+    for block in blocks {
+        let slot = block.message.slot;
+
+        if slot < start_slot || slot > end_slot {
+            warn!(%peer, %slot, start_slot, end_slot, "Received block outside requested range");
+            continue;
         }
+
+        let block_root = block.message.hash_tree_root();
+        if let Err(err) = blockchain.new_block(block) {
+            error!(
+                %err, %slot, %peer,
+                block_root = %ethlambda_types::ShortRoot(&block_root.0),
+                "Failed to forward range-fetched block to blockchain"
+            );
+        }
+    }
+
+    // Chain the next batch if there are more slots to fetch
+    if end_slot < total_end_slot {
+        request_blocks_by_range_from_peer(server, peer, end_slot + 1, total_end_slot).await;
     }
 }
 
@@ -342,7 +401,10 @@ pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
     }
 
     // Exclude peers that already returned empty responses for this root
-    let failed = server.pending_requests.get(&root).map(|p| &p.failed_peers);
+    let failed = server
+        .pending_root_requests
+        .get(&root)
+        .map(|p| &p.failed_peers);
     let pool: Vec<_> = if failed.is_none_or(|f| f.is_empty()) {
         server.connected_peers.iter().copied().collect()
     } else {
@@ -360,7 +422,7 @@ pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
     // retries start a fresh round of elimination.
     let pool = if pool.is_empty() {
         warn!(%root, "All peers failed for this block, retrying with full peer set");
-        if let Some(pending) = server.pending_requests.get_mut(&root) {
+        if let Some(pending) = server.pending_root_requests.get_mut(&root) {
             pending.failed_peers.clear();
         }
         server.connected_peers.iter().copied().collect()
@@ -401,7 +463,7 @@ pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
 
     // Track the request if not already tracked (new request)
     server
-        .pending_requests
+        .pending_root_requests
         .entry(root)
         .or_insert(PendingRequest {
             attempts: 1,
@@ -409,69 +471,97 @@ pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
         });
 
     // Map request_id to root for failure handling
-    server.request_id_map.insert(request_id, root);
+    server
+        .outbound_requests
+        .insert(request_id, PendingRequestKind::Root(root));
 
     true
 }
 
-async fn request_blocks_by_range_from_peer(
+pub async fn request_blocks_by_range_from_peer(
     server: &mut P2PServer,
     peer: PeerId,
     start_slot: u64,
-    count: u64,
+    total_end_slot: u64,
 ) -> bool {
-    if count == 0 {
+    if start_slot > total_end_slot {
         return true;
     }
-    let end_slot = start_slot.saturating_add(count).saturating_sub(1);
 
-    // Deduplicate: skip if we already have this range in-flight
-    if server.pending_sync_ranges.contains(&(start_slot, end_slot)) {
-        info!(%peer, start_slot, end_slot, "BlocksByRange already in-flight, skipping duplicate");
-        return true;
-    }
-    server.pending_sync_ranges.insert((start_slot, end_slot));
-
-    let mut remaining = count;
-    let mut next_slot = start_slot;
-
-    while remaining > 0 {
-        let batch_count = remaining.min(MAX_REQUEST_BLOCKS);
-        let request = BlocksByRangeRequest {
-            start_slot: next_slot,
-            count: batch_count,
-        };
-
-        info!(
-            %peer,
-            start_slot = next_slot,
-            count = batch_count,
-            "Sending BlocksByRange request"
-        );
-
-        let Some(request_id) = server
-            .swarm_handle
-            .send_request(
-                peer,
-                Request::BlocksByRange(request),
-                libp2p::StreamProtocol::new(BLOCKS_BY_RANGE_PROTOCOL_V1),
-            )
-            .await
-        else {
-            warn!(
+    // Trim effective_start forward past any in-flight coverage, handling
+    // non-contiguous gaps by looping until no range covers the current position.
+    let mut effective_start = start_slot;
+    loop {
+        let covered = server
+            .pending_range_requests
+            .iter()
+            .find(|&&(s, e)| s <= effective_start && effective_start <= e)
+            .copied();
+        match covered {
+            Some((_, covered_end)) => effective_start = covered_end + 1,
+            None => break,
+        }
+        if effective_start > total_end_slot {
+            info!(
                 %peer,
-                start_slot = next_slot,
-                count = batch_count,
-                "Failed to send BlocksByRange request (swarm adapter closed)"
+                start_slot,
+                total_end_slot,
+                "BlocksByRange fully covered by in-flight requests, skipping"
             );
-            return false;
-        };
-
-        server.range_request_ids.insert(request_id);
-
-        remaining -= batch_count;
-        next_slot = next_slot.saturating_add(batch_count);
+            return true;
+        }
     }
+
+    // Send only one batch — response handler chains the next one
+    let count = (total_end_slot - effective_start + 1).min(MAX_REQUEST_BLOCKS);
+    let batch_end = effective_start.saturating_add(count).saturating_sub(1);
+
+    server
+        .pending_range_requests
+        .insert((effective_start, batch_end));
+
+    let request = BlocksByRangeRequest {
+        start_slot: effective_start,
+        count,
+    };
+
+    info!(
+        %peer,
+        start_slot = effective_start,
+        count,
+        total_end_slot,
+        "Sending BlocksByRange request (single batch)"
+    );
+
+    let Some(request_id) = server
+        .swarm_handle
+        .send_request(
+            peer,
+            Request::BlocksByRange(request),
+            libp2p::StreamProtocol::new(BLOCKS_BY_RANGE_PROTOCOL_V1),
+        )
+        .await
+    else {
+        warn!(
+            %peer,
+            start_slot = effective_start,
+            count,
+            "Failed to send BlocksByRange request"
+        );
+        server
+            .pending_range_requests
+            .remove(&(effective_start, batch_end));
+        return false;
+    };
+
+    server.outbound_requests.insert(
+        request_id,
+        PendingRequestKind::Range {
+            start_slot: effective_start,
+            end_slot: batch_end,
+            total_end_slot,
+        },
+    );
 
     true
 }
@@ -482,7 +572,7 @@ async fn handle_fetch_failure(
     peer: PeerId,
     ctx: &Context<P2PServer>,
 ) {
-    let Some(pending) = server.pending_requests.get_mut(&root) else {
+    let Some(pending) = server.pending_root_requests.get_mut(&root) else {
         return;
     };
 
@@ -491,7 +581,7 @@ async fn handle_fetch_failure(
     if pending.attempts >= MAX_FETCH_RETRIES {
         error!(%root, %peer, attempts=%pending.attempts,
                "Block fetch failed after max retries, giving up");
-        server.pending_requests.remove(&root);
+        server.pending_root_requests.remove(&root);
         return;
     }
 
