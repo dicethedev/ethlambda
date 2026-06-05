@@ -42,7 +42,7 @@ use crate::{
     req_resp::{
         BLOCKS_BY_RANGE_PROTOCOL_V1, BLOCKS_BY_ROOT_PROTOCOL_V1, Codec,
         MAX_COMPRESSED_PAYLOAD_SIZE, MAX_REQUEST_BLOCKS, Request, STATUS_PROTOCOL_V1, build_status,
-        fetch_block_from_peer, request_blocks_by_range_from_peer,
+        fetch_block_from_peer,
     },
     swarm_adapter::SwarmHandle,
 };
@@ -371,13 +371,6 @@ pub(crate) trait P2PProtocol: Send + Sync {
     fn retry_block_fetch(&self, root: H256) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_peer_redial(&self, peer_id: PeerId) -> Result<(), ActorError>;
-    #[allow(dead_code)]
-    fn retry_range_sync(
-        &self,
-        start_slot: u64,
-        end_slot: u64,
-        peer_id: PeerId,
-    ) -> Result<(), ActorError>;
 }
 
 #[actor(protocol = P2PProtocol)]
@@ -421,31 +414,6 @@ impl P2PServer {
             info!(%peer_id, "Redialing disconnected bootnode");
             self.swarm_handle.dial(addr.clone());
         }
-    }
-
-    #[send_handler]
-    async fn handle_retry_range_sync(
-        &mut self,
-        msg: p2p_protocol::RetryRangeSync,
-        _ctx: &Context<Self>,
-    ) {
-        let start_slot = msg.start_slot;
-        let end_slot = msg.end_slot;
-        let peer = msg.peer_id;
-
-        // safety check: if already synced, skip retry
-        let still_needed = !self
-            .pending_range_requests
-            .contains(&(start_slot, end_slot));
-
-        if still_needed {
-            tracing::trace!(%peer, start_slot, end_slot, "Skipping retry, range already resolved");
-            return;
-        }
-
-        info!(%peer, start_slot, end_slot, "Retrying BlocksByRange sync");
-
-        request_blocks_by_range_from_peer(self, peer, start_slot, end_slot).await;
     }
 }
 

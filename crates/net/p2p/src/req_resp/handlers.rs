@@ -121,19 +121,16 @@ pub async fn handle_req_resp_message(
                 Some(PendingRequestKind::Range {
                     start_slot,
                     end_slot,
-                    total_end_slot,
+                    ..
                 }) => {
                     server
                         .pending_range_requests
                         .remove(&(start_slot, end_slot));
-                    send_after(
-                        Duration::from_millis(500),
-                        ctx.clone(),
-                        p2p_protocol::RetryRangeSync {
-                            peer_id: peer,
-                            start_slot,
-                            end_slot: total_end_slot, // retry the full remaining range
-                        },
+                    warn!(
+                        %peer,
+                        start_slot,
+                        end_slot,
+                        "BlocksByRange request failed; retry is disabled"
                     );
                 }
                 None => {}
