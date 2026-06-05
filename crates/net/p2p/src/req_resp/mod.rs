@@ -5,9 +5,7 @@ mod messages;
 
 pub use codec::Codec;
 pub use encoding::{MAX_COMPRESSED_PAYLOAD_SIZE, MAX_PAYLOAD_SIZE};
-pub use handlers::{
-    build_status, fetch_block_from_peer, handle_req_resp_message, request_blocks_by_range_from_peer,
-};
+pub use handlers::{build_status, fetch_block_from_peer, handle_req_resp_message};
 pub use messages::{
     BLOCKS_BY_RANGE_PROTOCOL_V1, BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRangeRequest,
     BlocksByRootRequest, MAX_REQUEST_BLOCKS, Request, RequestedBlockRoots, Response,

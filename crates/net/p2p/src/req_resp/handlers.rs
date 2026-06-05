@@ -18,7 +18,8 @@ use super::{
 };
 use crate::{
     BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, MAX_SYNC_RANGE, P2PServer,
-    PendingRequest, PendingRequestKind, p2p_protocol, req_resp::RequestedBlockRoots,
+    PendingRequest, PendingRequestKind, RangeSyncState, p2p_protocol,
+    req_resp::RequestedBlockRoots,
 };
 
 pub async fn handle_req_resp_message(
@@ -71,18 +72,9 @@ pub async fn handle_req_resp_message(
                                 Some(PendingRequestKind::Range {
                                     start_slot,
                                     end_slot,
-                                    total_end_slot,
                                 }) => {
-                                    server
-                                        .pending_range_requests
-                                        .remove(&(start_slot, end_slot));
                                     handle_blocks_by_range_response(
-                                        server,
-                                        blocks,
-                                        peer,
-                                        start_slot,
-                                        end_slot,
-                                        total_end_slot,
+                                        server, blocks, peer, start_slot, end_slot,
                                     )
                                     .await;
                                 }
@@ -101,6 +93,16 @@ pub async fn handle_req_resp_message(
                     Response::Error { code, message } => {
                         let error_str = String::from_utf8_lossy(&message);
                         warn!(%peer, ?code, %error_str, "Received error response");
+
+                        match server.outbound_requests.remove(&request_id) {
+                            Some(PendingRequestKind::Range { .. }) => {
+                                fail_range_request(server, &peer);
+                            }
+                            Some(request @ PendingRequestKind::Root(_)) => {
+                                server.outbound_requests.insert(request_id, request);
+                            }
+                            None => {}
+                        }
                     }
                 }
             }
@@ -121,11 +123,8 @@ pub async fn handle_req_resp_message(
                 Some(PendingRequestKind::Range {
                     start_slot,
                     end_slot,
-                    ..
                 }) => {
-                    server
-                        .pending_range_requests
-                        .remove(&(start_slot, end_slot));
+                    fail_range_request(server, &peer);
                     warn!(
                         %peer,
                         start_slot,
@@ -173,10 +172,20 @@ async fn handle_status_response(server: &mut P2PServer, status: Status, peer: Pe
     }
     let gap = status.head.slot - our_head_slot;
     let start_slot = our_head_slot.saturating_add(1);
-    let total_end_slot = start_slot
-        .saturating_add(gap.min(MAX_SYNC_RANGE))
-        .saturating_sub(1);
-    request_blocks_by_range_from_peer(server, peer, start_slot, total_end_slot).await;
+    let end_exclusive = start_slot.saturating_add(gap.min(MAX_SYNC_RANGE));
+
+    match &mut server.range_sync_state {
+        Some(state) => state.merge_peer(peer, status.head.slot, end_exclusive),
+        None => {
+            server.range_sync_state = Some(RangeSyncState::new(
+                start_slot..end_exclusive,
+                peer,
+                status.head.slot,
+            ));
+        }
+    }
+
+    request_next_range_batch(server).await;
     info!(%peer, start_slot, gap, "Long-range sync: using BlocksByRange");
 }
 
@@ -330,20 +339,17 @@ async fn handle_blocks_by_range_response(
     peer: PeerId,
     start_slot: u64,
     end_slot: u64,
-    total_end_slot: u64,
 ) {
-    server
-        .pending_range_requests
-        .remove(&(start_slot, end_slot));
-
     info!(%peer, count = blocks.len(), "Received BlocksByRange response");
 
     if blocks.is_empty() {
+        fail_range_request(server, &peer);
         warn!(%peer, start_slot, end_slot, "Received empty BlocksByRange response");
         return;
     }
 
     let Some(ref blockchain) = server.blockchain else {
+        server.range_sync_state = None;
         warn!(%peer, "No blockchain handler available");
         return;
     };
@@ -366,10 +372,15 @@ async fn handle_blocks_by_range_response(
         }
     }
 
-    // Chain the next batch if there are more slots to fetch
-    if end_slot < total_end_slot {
-        request_blocks_by_range_from_peer(server, peer, end_slot + 1, total_end_slot).await;
+    if let Some(state) = &mut server.range_sync_state {
+        state.complete_batch(end_slot);
+        if state.current_range.is_empty() || state.peer_set.is_empty() {
+            server.range_sync_state = None;
+            return;
+        }
     }
+
+    request_next_range_batch(server).await;
 }
 
 /// Build a Status message from the current Store state.
@@ -475,58 +486,30 @@ pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
     true
 }
 
-pub async fn request_blocks_by_range_from_peer(
-    server: &mut P2PServer,
-    peer: PeerId,
-    start_slot: u64,
-    total_end_slot: u64,
-) -> bool {
-    if start_slot > total_end_slot {
+async fn request_next_range_batch(server: &mut P2PServer) -> bool {
+    let Some((peer, batch)) = server
+        .range_sync_state
+        .as_ref()
+        .and_then(RangeSyncState::next_batch)
+    else {
         return true;
-    }
-
-    // Trim effective_start forward past any in-flight coverage, handling
-    // non-contiguous gaps by looping until no range covers the current position.
-    let mut effective_start = start_slot;
-    loop {
-        let covered = server
-            .pending_range_requests
-            .iter()
-            .find(|&&(s, e)| s <= effective_start && effective_start <= e)
-            .copied();
-        match covered {
-            Some((_, covered_end)) => effective_start = covered_end + 1,
-            None => break,
-        }
-        if effective_start > total_end_slot {
-            info!(
-                %peer,
-                start_slot,
-                total_end_slot,
-                "BlocksByRange fully covered by in-flight requests, skipping"
-            );
-            return true;
-        }
-    }
-
-    // Send only one batch — response handler chains the next one
-    let count = (total_end_slot - effective_start + 1).min(MAX_REQUEST_BLOCKS);
-    let batch_end = effective_start.saturating_add(count).saturating_sub(1);
-
-    server
-        .pending_range_requests
-        .insert((effective_start, batch_end));
+    };
 
     let request = BlocksByRangeRequest {
-        start_slot: effective_start,
-        count,
+        start_slot: batch.start,
+        count: batch.end - batch.start,
     };
+    let count = request.count;
 
     info!(
         %peer,
-        start_slot = effective_start,
+        start_slot = batch.start,
         count,
-        total_end_slot,
+        total_end_slot = server
+            .range_sync_state
+            .as_ref()
+            .map_or(batch.end, |state| state.current_range.end)
+            .saturating_sub(1),
         "Sending BlocksByRange request (single batch)"
     );
 
@@ -541,26 +524,40 @@ pub async fn request_blocks_by_range_from_peer(
     else {
         warn!(
             %peer,
-            start_slot = effective_start,
+            start_slot = batch.start,
             count,
             "Failed to send BlocksByRange request"
         );
-        server
-            .pending_range_requests
-            .remove(&(effective_start, batch_end));
+        fail_range_request(server, &peer);
         return false;
     };
+
+    if let Some(state) = &mut server.range_sync_state {
+        state.in_flight = true;
+    }
 
     server.outbound_requests.insert(
         request_id,
         PendingRequestKind::Range {
-            start_slot: effective_start,
-            end_slot: batch_end,
-            total_end_slot,
+            start_slot: batch.start,
+            end_slot: batch.end - 1,
         },
     );
 
     true
+}
+
+fn fail_range_request(server: &mut P2PServer, peer: &PeerId) {
+    let should_clear = if let Some(state) = &mut server.range_sync_state {
+        state.fail_peer(peer);
+        state.peer_set.is_empty()
+    } else {
+        false
+    };
+
+    if should_clear {
+        server.range_sync_state = None;
+    }
 }
 
 async fn handle_fetch_failure(
