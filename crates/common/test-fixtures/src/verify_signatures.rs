@@ -1,17 +1,17 @@
-//! Signature-verification test fixture types (leanSpec PR #717 schema).
+//! Signature-verification test fixture types (leanSpec PR #799 schema).
 //!
 //! Used both by the offline spec-test runner and the Hive
 //! `/lean/v0/test_driver/verify_signatures/run` endpoint, which receive the
 //! same JSON shapes from the lean spec-assets simulator.
 //!
-//! Fixture shape after PR #717:
+//! Fixture shape after PR #799:
 //!
 //!   signedBlock:
 //!     block:  {...standard block fields...}
-//!     proof:  { data: "0x<hex-encoded merged Type-2 bytes>" }
+//!     proof:  { proof: { data: "0x<hex-encoded merged Type-2 bytes>" } }
 
 use crate::{Block, TestInfo, TestState};
-use ethlambda_types::block::{ByteList512KiB, SignedBlock};
+use ethlambda_types::block::SignedBlock;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt;
@@ -56,7 +56,22 @@ pub struct VerifySignaturesTest {
 pub struct TestSignedBlock {
     #[serde(alias = "message")]
     pub block: Block,
+    pub proof: MergedProof,
+}
+
+/// Merged Type-2 proof container for `SignedBlock.proof` (leanSpec PR #799).
+///
+/// The multi-signature container nests the raw lean-multisig wire one level
+/// deep: `{ "proof": { "data": "0x..." } }`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MergedProof {
     pub proof: HexBytes,
+}
+
+impl MergedProof {
+    pub fn decode(&self) -> Result<Vec<u8>, hex::FromHexError> {
+        self.proof.decode()
+    }
 }
 
 /// `{ "data": "0x..." }` wrapper used by leanSpec fixtures for byte fields.
@@ -107,13 +122,16 @@ impl From<TestSignedBlock> for SignedBlock {
 impl TestSignedBlock {
     /// Materialize a `SignedBlock` preserving the fixture-supplied merged
     /// Type-2 proof bytes verbatim.
+    ///
+    /// The container carries the raw lean-multisig wire, so it gets wrapped
+    /// into the SSZ-container envelope that `SignedBlock.proof` stores.
     pub fn try_into_signed_block_with_proofs(self) -> Result<SignedBlock, SignedBlockConvertError> {
         let bytes = self
             .proof
             .decode()
             .map_err(|err| SignedBlockConvertError::InvalidProofHex(err.to_string()))?;
         let len = bytes.len();
-        let proof = ByteList512KiB::try_from(bytes)
+        let proof = SignedBlock::wrap_merged_proof(&bytes)
             .map_err(|_| SignedBlockConvertError::ProofTooLarge(len))?;
         Ok(SignedBlock {
             message: self.block.into(),
