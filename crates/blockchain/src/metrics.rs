@@ -491,6 +491,7 @@ static LEAN_BLOCK_PROPOSAL_AGGREGATES_SELECTED: std::sync::LazyLock<Histogram> =
 // --- Sync Status ---
 
 /// Node synchronization status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncStatus {
     Idle,
     Syncing,
