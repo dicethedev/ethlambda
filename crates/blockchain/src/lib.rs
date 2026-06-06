@@ -720,10 +720,7 @@ impl BlockChainServer {
         let head_slot = self.store.head_slot();
         let max_seen_slot = self
             .store
-            .get_live_chain()
-            .values()
-            .map(|(slot, _)| *slot)
-            .max()
+            .max_live_chain_slot()
             .unwrap_or(head_slot);
         let status = self
             .sync_status
