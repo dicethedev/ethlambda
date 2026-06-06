@@ -86,7 +86,7 @@ impl SyncStatusTracker {
         if network_lag > NETWORK_STALL_THRESHOLD {
             self.syncing = false;
         } else if self.syncing {
-            self.syncing = head_lag > SYNC_LAG_THRESHOLD - SYNC_HYSTERESIS_BAND;
+            self.syncing = head_lag > SYNC_LAG_THRESHOLD.saturating_sub(SYNC_HYSTERESIS_BAND);
         } else {
             self.syncing = head_lag > SYNC_LAG_THRESHOLD;
         }
