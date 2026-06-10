@@ -44,11 +44,28 @@ pub struct ForkChoiceTest {
     #[serde(rename = "anchorBlock")]
     pub anchor_block: Block,
     pub steps: Vec<ForkChoiceStep>,
+    /// Aggregation proof regime: 0 = mocked (placeholder bytes, must not be
+    /// verified), 1 = real and must verify, 2 = real and must fail
+    /// verification. Older fixtures lack the field and carry real proofs.
+    #[serde(rename = "proofSetting", default = "default_proof_setting")]
+    pub proof_setting: u8,
     #[serde(rename = "maxSlot")]
     #[allow(dead_code)]
     pub max_slot: u64,
     #[serde(rename = "_info")]
     pub info: TestInfo,
+}
+
+fn default_proof_setting() -> u8 {
+    1
+}
+
+impl ForkChoiceTest {
+    /// Whether the vector's aggregation proofs are placeholders that must
+    /// not be cryptographically verified (`proofSetting == 0`).
+    pub fn proofs_are_mocked(&self) -> bool {
+        self.proof_setting == 0
+    }
 }
 
 // ============================================================================
@@ -76,6 +93,11 @@ pub struct ForkChoiceStep {
     pub has_proposal: Option<bool>,
     #[serde(rename = "isAggregator")]
     pub is_aggregator: Option<bool>,
+    /// Whether the harness must advance the store clock to the block's slot
+    /// before delivering a `block` step. Early-arrival tests set this to
+    /// `false` to deliver the block ahead of the store clock.
+    #[serde(rename = "tickToSlot", default = "default_true")]
+    pub tick_to_slot: bool,
 }
 
 fn default_true() -> bool {

@@ -41,6 +41,10 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         }
         println!("Running test: {}", name);
 
+        // Mocked-proof vectors (`proofSetting == 0`) carry placeholder
+        // aggregation proofs that must not be cryptographically verified.
+        let proofs_are_mocked = test.proofs_are_mocked();
+
         // Initialize store from anchor state/block.
         //
         // Fixtures whose `steps` is empty are "anchor rejection" cases (e.g.
@@ -93,11 +97,14 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 
                     let signed_block = block_data.to_blank_signed_block();
 
-                    let block_time_ms =
-                        genesis_time * 1000 + signed_block.message.slot * MILLISECONDS_PER_SLOT;
-
+                    // Advance time to the block's slot unless the test delivers
+                    // the block ahead of the store clock.
                     // NOTE: the has_proposal argument is set to true, following the spec
-                    store::on_tick(&mut store, block_time_ms, true);
+                    if step.tick_to_slot {
+                        let block_time_ms =
+                            genesis_time * 1000 + signed_block.message.slot * MILLISECONDS_PER_SLOT;
+                        store::on_tick(&mut store, block_time_ms, true);
+                    }
                     let result = store::on_block_without_verification(&mut store, signed_block);
                     let import_ok = result.is_ok();
                     assert_step_outcome(step_idx, step.valid, result)?;
@@ -184,7 +191,13 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                         TypeOneMultiSignature::new(proof_fixture.participants.into(), proof_data);
                     let aggregated = SignedAggregatedAttestation { data, proof };
 
-                    let result = store::on_gossip_aggregated_attestation(&mut store, aggregated);
+                    let result = if proofs_are_mocked {
+                        store::on_gossip_aggregated_attestation_without_verification(
+                            &mut store, aggregated,
+                        )
+                    } else {
+                        store::on_gossip_aggregated_attestation(&mut store, aggregated)
+                    };
                     assert_step_outcome(step_idx, step.valid, result)?;
                 }
                 other => {

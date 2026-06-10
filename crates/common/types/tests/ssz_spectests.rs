@@ -5,7 +5,7 @@ use ethlambda_types::primitives::HashTreeRoot;
 mod ssz_types;
 use ssz_types::{SszTestCase, SszTestVector, decode_hex, decode_hex_h256};
 
-const SUPPORTED_FIXTURE_FORMAT: &str = "ssz";
+const SUPPORTED_FIXTURE_FORMAT: &str = "ssz_test";
 
 fn run(path: &Path) -> datatest_stable::Result<()> {
     let tests = SszTestVector::from_file(path)?;
