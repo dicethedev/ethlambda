@@ -8,8 +8,9 @@ use ethlambda_types::{
     ShortRoot,
     aggregator::AggregatorController,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    block::{BlockSignatures, SignedBlock},
+    block::{ByteList512KiB, MultiMessageAggregate, SignedBlock},
     primitives::{H256, HashTreeRoot as _},
+    signature::{ValidatorPublicKey, ValidatorSignature},
 };
 
 use crate::aggregation::{
@@ -22,7 +23,7 @@ use spawned_concurrency::error::ActorError;
 use spawned_concurrency::protocol;
 use spawned_concurrency::tasks::{Actor, ActorRef, ActorStart, Context, Handler, send_after};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::store::StoreError;
 
@@ -32,6 +33,7 @@ pub(crate) mod coverage;
 pub(crate) mod fork_choice_tree;
 pub mod key_manager;
 pub mod metrics;
+pub mod reaggregate;
 pub mod store;
 
 pub struct BlockChain {
@@ -44,10 +46,7 @@ pub const MILLISECONDS_PER_INTERVAL: u64 = 800;
 pub const INTERVALS_PER_SLOT: u64 = 5;
 /// Milliseconds in a slot (derived from interval duration and count).
 pub const MILLISECONDS_PER_SLOT: u64 = MILLISECONDS_PER_INTERVAL * INTERVALS_PER_SLOT;
-/// Maximum number of distinct AttestationData entries per block.
-///
-/// See: leanSpec commit 0c9528a (PR #536).
-pub const MAX_ATTESTATIONS_DATA: usize = 16;
+pub use ethlambda_types::block::MAX_ATTESTATIONS_DATA;
 /// Future-slot tolerance for gossip attestations, expressed in intervals.
 ///
 /// Bounds the clock skew the time check is willing to absorb when admitting a
@@ -66,6 +65,14 @@ fn ms_until_next_interval(now_ms: u64, genesis_time_ms: u64) -> u64 {
     MILLISECONDS_PER_INTERVAL - (ms_since_genesis % MILLISECONDS_PER_INTERVAL)
 }
 
+/// Current UNIX timestamp in milliseconds.
+fn unix_now_ms() -> u64 {
+    SystemTime::UNIX_EPOCH
+        .elapsed()
+        .expect("already past the unix epoch")
+        .as_millis() as u64
+}
+
 impl BlockChain {
     pub fn spawn(
         store: Store,
@@ -81,10 +88,7 @@ impl BlockChain {
         // Catch XMSS keys up to the current slot before the first tick
         // store.time() doesn't work here: after an offline gap it lags wall-clock by
         // exactly the gap we need to catch up through
-        let now_ms = SystemTime::UNIX_EPOCH
-            .elapsed()
-            .expect("already past the unix epoch")
-            .as_millis() as u64;
+        let now_ms = unix_now_ms();
         let current_slot =
             (now_ms.saturating_sub(genesis_time * 1000) / MILLISECONDS_PER_SLOT) as u32;
         key_manager.advance_keys_to(current_slot);
@@ -168,12 +172,6 @@ pub struct BlockChainServer {
 
 impl BlockChainServer {
     async fn on_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
-        // Observe tick interval duration before any processing
-        if let Some(prev_instant) = self.last_tick_instant {
-            metrics::observe_tick_interval_duration(prev_instant.elapsed());
-        }
-        self.last_tick_instant = Some(Instant::now());
-
         let genesis_time_ms = self.store.config().genesis_time * 1000;
 
         // Calculate current slot and interval from milliseconds
@@ -181,12 +179,39 @@ impl BlockChainServer {
         let slot = time_since_genesis_ms / MILLISECONDS_PER_SLOT;
         let interval = (time_since_genesis_ms % MILLISECONDS_PER_SLOT) / MILLISECONDS_PER_INTERVAL;
 
+        // Idempotency guard
+        //
+        // `slot`/`interval` come from the wall clock, but the tick cadence is driven
+        // by the monotonic clock (`tokio::sleep`). The wall clock can drift behind it
+        // inside VMs, so a tick scheduled for the next interval boundary can fire
+        // while the wall clock still reads the previous interval.
+        let tick_interval = time_since_genesis_ms / MILLISECONDS_PER_INTERVAL;
+        let store_time = self.store.time();
+
+        if store_time > 0 && tick_interval <= store_time {
+            debug!(
+                %slot,
+                %interval,
+                tick_interval,
+                store_time,
+                "Skipping already-processed tick"
+            );
+            return;
+        }
+
         // Fail fast: a state with zero validators is invalid and would cause
         // panics in proposer selection and attestation processing.
         if self.store.head_state().validators.is_empty() {
             error!("Head state has no validators, skipping tick");
             return;
         }
+
+        // Observe tick interval duration. Done after the idempotency guard so a
+        // skipped duplicate tick doesn't shorten the next real tick's sample.
+        if let Some(prev_instant) = self.last_tick_instant {
+            metrics::observe_tick_interval_duration(prev_instant.elapsed());
+        }
+        self.last_tick_instant = Some(Instant::now());
 
         // Update current slot metric
         metrics::update_current_slot(slot);
@@ -388,7 +413,7 @@ impl BlockChainServer {
         let _timing = metrics::time_block_building();
 
         // Build the block with attestation signatures
-        let Ok((block, attestation_signatures, _post_checkpoints)) =
+        let Ok((block, type_one_proofs, _post_checkpoints)) =
             store::produce_block_with_signatures(&mut self.store, slot, validator_id)
                 .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
         else {
@@ -413,15 +438,103 @@ impl BlockChainServer {
             return;
         };
 
-        // Assemble SignedBlock
+        // Assemble SignedBlock: wrap the proposer's raw XMSS signature into a
+        // singleton Type-1 SNARK, then merge it with every attestation Type-1
+        // into the block's single Type-2 proof.
+        let head_state = self.store.head_state();
+        let validators = &head_state.validators;
+        let Some(proposer_validator) = validators.get(validator_id as usize) else {
+            error!(%slot, %validator_id, "Proposer index out of range when assembling block");
+            metrics::inc_block_building_failures();
+            return;
+        };
+
+        // Decode the proposer's proposal pubkey once and reuse it both for the
+        // singleton Type-1 wrap and for the Type-2 merge inputs.
+        let Ok(proposer_pubkey) = proposer_validator.get_proposal_pubkey().inspect_err(
+            |err| error!(%slot, %validator_id, %err, "Failed to decode proposer proposal pubkey"),
+        ) else {
+            metrics::inc_block_building_failures();
+            return;
+        };
+
+        let Ok(proposer_validator_signature) =
+            ValidatorSignature::from_bytes(&proposer_signature).inspect_err(|err| {
+                error!(%slot, %validator_id, %err, "Failed to decode proposer signature bytes")
+            })
+        else {
+            metrics::inc_block_building_failures();
+            return;
+        };
+        let Ok(proposer_proof_bytes) = ethlambda_crypto::aggregate_signatures(
+            vec![proposer_pubkey.clone()],
+            vec![proposer_validator_signature],
+            &block_root,
+            slot as u32,
+        )
+        .inspect_err(
+            |err| error!(%slot, %validator_id, %err, "Failed to wrap proposer signature as Type-1"),
+        ) else {
+            metrics::inc_block_building_failures();
+            return;
+        };
+
+        let mut merge_inputs: Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)> =
+            Vec::with_capacity(type_one_proofs.len() + 1);
+        let mut resolve_failed = false;
+        for t1 in &type_one_proofs {
+            let mut pubkeys = Vec::new();
+            for vid in t1.participant_indices() {
+                let Some(validator) = validators.get(vid as usize) else {
+                    error!(%slot, %validator_id, vid, "Participant out of range while resolving pubkeys");
+                    resolve_failed = true;
+                    break;
+                };
+                match validator.get_attestation_pubkey() {
+                    Ok(pk) => pubkeys.push(pk),
+                    Err(err) => {
+                        error!(%slot, %validator_id, vid, %err, "Failed to decode attestation pubkey");
+                        resolve_failed = true;
+                        break;
+                    }
+                }
+            }
+            if resolve_failed {
+                break;
+            }
+            merge_inputs.push((pubkeys, t1.proof.clone()));
+        }
+        if resolve_failed {
+            metrics::inc_block_building_failures();
+            return;
+        }
+        merge_inputs.push((vec![proposer_pubkey], proposer_proof_bytes));
+
+        // Merge yields raw lean-multisig Type-2 bytes. Per-component
+        // participants are rederived at verify time from
+        // `block.body.attestations[i].aggregation_bits` plus
+        // `block.proposer_index`, so nothing else needs persisting.
+        let merged_bytes = match ethlambda_crypto::merge_type_1s_into_type_2(merge_inputs) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                error!(%slot, %validator_id, %err, "Failed to merge Type-1s into Type-2");
+                metrics::inc_block_building_failures();
+                return;
+            }
+        };
+        let proof = match MultiMessageAggregate::from_bytes(merged_bytes.iter().as_slice()) {
+            Ok(p) => p,
+            Err(err) => {
+                error!(%slot, %validator_id, %err, "Failed to build multi-message aggregate");
+                metrics::inc_block_building_failures();
+                return;
+            }
+        };
+        // `type_one_proofs` is no longer needed past this point.
+        drop(type_one_proofs);
         let signed_block = SignedBlock {
             message: block,
-            signature: BlockSignatures {
-                proposer_signature,
-                attestation_signatures: attestation_signatures
-                    .try_into()
-                    .expect("attestation signatures within limit"),
-            },
+            proof,
         };
 
         // Process the block locally before publishing
@@ -443,7 +556,9 @@ impl BlockChainServer {
         info!(%slot, %validator_id, "Published block");
     }
 
-    fn process_block(&mut self, signed_block: SignedBlock) -> Result<(), StoreError> {
+    /// Run block import, refresh metrics, and report whether the node is in
+    /// sync with the wall-clock slot after the import.
+    fn process_block(&mut self, signed_block: SignedBlock) -> Result<bool, StoreError> {
         store::on_block(&mut self.store, signed_block)?;
         let head_slot = self.store.head_slot();
         metrics::update_head_slot(head_slot);
@@ -453,7 +568,8 @@ impl BlockChainServer {
 
         // Update sync status based on head slot vs wall clock slot
         let current_slot = self.store.time() / INTERVALS_PER_SLOT;
-        let status = if head_slot >= current_slot {
+        let synced = head_slot >= current_slot;
+        let status = if synced {
             metrics::SyncStatus::Synced
         } else {
             metrics::SyncStatus::Syncing
@@ -463,7 +579,7 @@ impl BlockChainServer {
         for table in ALL_TABLES {
             metrics::update_table_bytes(table.name(), self.store.estimate_table_bytes(table));
         }
-        Ok(())
+        Ok(synced)
     }
 
     /// Process a newly received block.
@@ -581,9 +697,12 @@ impl BlockChainServer {
             return;
         }
 
-        // Parent exists, proceed with processing
+        // Parent exists, proceed with processing. Clone the block so we
+        // can run post-import reaggregation against its merged proof —
+        // `process_block` consumes the original for the storage layer.
+        let block_for_reaggregate = signed_block.clone();
         match self.process_block(signed_block) {
-            Ok(_) => {
+            Ok(synced) => {
                 info!(
                     %slot,
                     proposer,
@@ -591,6 +710,17 @@ impl BlockChainServer {
                     parent_root = %ShortRoot(&parent_root.0),
                     "Block imported successfully"
                 );
+
+                // Recover per-attestation Type-1 proofs from the block's
+                // merged Type-2 and fold them into the local pool. Only
+                // run when the chain is in sync — backfilling nodes must
+                // not spam gossip with rederived aggregates. Non-validator
+                // nodes still benefit from the store update because the
+                // recovered proofs feed fork choice on the next acceptance
+                // tick.
+                if synced {
+                    self.run_reaggregate_from_block(&block_for_reaggregate);
+                }
 
                 // Enqueue any pending blocks that were waiting for this parent
                 self.collect_pending_children(block_root, queue);
@@ -605,6 +735,32 @@ impl BlockChainServer {
                     "Failed to process block"
                 );
             }
+        }
+    }
+
+    /// Run the post-import reaggregation pass and publish the resulting
+    /// aggregates when this node is in the aggregator role.
+    fn run_reaggregate_from_block(&mut self, signed_block: &SignedBlock) {
+        let aggregates = reaggregate::reaggregate_from_block(&mut self.store, signed_block);
+        if aggregates.is_empty() {
+            return;
+        }
+        let count = aggregates.len();
+        let is_aggregator = self.aggregator.is_enabled();
+        info!(
+            count,
+            is_aggregator, "Reaggregated block-borne attestations"
+        );
+        if !is_aggregator {
+            return;
+        }
+        let Some(ref p2p) = self.p2p else {
+            return;
+        };
+        for aggregate in aggregates {
+            let _ = p2p
+                .publish_aggregated_attestation(aggregate)
+                .inspect_err(|err| warn!(%err, "Failed to publish reaggregated attestation"));
         }
     }
 
@@ -692,14 +848,22 @@ pub(crate) trait BlockChainProtocol: Send + Sync {
 impl BlockChainServer {
     #[send_handler]
     async fn handle_tick(&mut self, _msg: block_chain_protocol::Tick, ctx: &Context<Self>) {
-        let timestamp = SystemTime::UNIX_EPOCH
-            .elapsed()
-            .expect("already past the unix epoch");
-        let now_ms = timestamp.as_millis() as u64;
+        let now_ms = unix_now_ms();
         self.on_tick(now_ms, ctx).await;
-        // Schedule the next tick at the next interval boundary
+
         let genesis_time_ms = self.store.config().genesis_time * 1000;
-        let ms_to_next_interval = ms_until_next_interval(now_ms, genesis_time_ms);
+        let remaining_at_entry = ms_until_next_interval(now_ms, genesis_time_ms);
+        let now_after_tick = unix_now_ms();
+        let elapsed = now_after_tick.saturating_sub(now_ms);
+
+        // If on_tick ran past the next interval boundary, tick again
+        // immediately so that interval's duty still runs (issue #413).
+        let ms_to_next_interval = if elapsed >= remaining_at_entry {
+            0
+        } else {
+            // Schedule the next tick at the next interval boundary
+            ms_until_next_interval(now_after_tick, genesis_time_ms)
+        };
         send_after(
             Duration::from_millis(ms_to_next_interval),
             ctx.clone(),
