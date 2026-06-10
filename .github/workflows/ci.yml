@@ -55,9 +55,11 @@ jobs:
             fixtures_url=$(echo "$json" | python3 -c "import sys,json; j=json.load(sys.stdin); print(next(a.get('browser_download_url') for a in j.get('assets',[]) if a.get('name')=='fixtures-prod-scheme.tar.gz'))")
             sha_url=$(echo "$json" | python3 -c "import sys,json; j=json.load(sys.stdin); print(next(a.get('browser_download_url') for a in j.get('assets',[]) if a.get('name')=='fixtures-prod-scheme.tar.gz.sha256'))")
           sha=$(curl -sL "$sha_url" | cut -d' ' -f1)
-          echo "url=$fixtures_url" >> $GITHUB_OUTPUT
-          echo "sha_url=$sha_url" >> $GITHUB_OUTPUT
-          echo "sha=$sha" >> $GITHUB_OUTPUT
+          {
+            echo "url=$fixtures_url"
+            echo "sha_url=$sha_url"
+            echo "sha=$sha"
+          } >> $GITHUB_OUTPUT
 
       - name: Restore test fixtures cache
         id: cache-fixtures
