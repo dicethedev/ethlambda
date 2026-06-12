@@ -23,6 +23,18 @@ pub const ATTESTATION_AGGREGATE_COVERAGE_SECTIONS: &[&str] = &[
 /// locally-aggregated pre-merge (`timely`) payloads.
 pub const ATTESTATION_AGGREGATE_COVERAGE_DIFF_DIRECTIONS: &[&str] = &["block_only", "timely_only"];
 
+/// Phase labels for `lean_block_proposal_attestation_build_phase_seconds`.
+///
+/// `select_payloads`: greedy per-`AttestationData` proof selection.
+/// `compact`: recursive merge of proofs sharing the same `AttestationData`.
+/// `stf_simulate`: the single candidate-block state transition that seals the
+/// state root. Unlike leanSpec (which re-runs the STF inside a fixed-point
+/// loop), ethlambda projects justification/finalization incrementally during
+/// `select_payloads` and runs the STF exactly once, so its `stf_simulate`
+/// timing is a single observation per build rather than one per loop round.
+pub const BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASES: &[&str] =
+    &["select_payloads", "compact", "stf_simulate"];
+
 // --- Gauges ---
 
 static LEAN_HEAD_SLOT: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
@@ -128,9 +140,8 @@ static LEAN_ATTESTATION_AGGREGATE_COVERAGE_VALIDATORS: std::sync::LazyLock<IntGa
         register_int_gauge_vec!(
             "lean_attestation_aggregate_coverage_validators",
             "Validator coverage in attestation aggregate reports, labeled by section and \
-             subnet. Only subnet=combined (the section total) is currently emitted; the \
-             subnet=subnet_N per-subnet breakdown is reserved and not yet populated. \
-             Updated each slot (slot is the X-axis).",
+             subnet. subnet=combined is the section total; subnet=subnet_N is the count of \
+             validators in subnet N that were seen. Updated each slot (slot is the X-axis).",
             &["section", "subnet"]
         )
         .unwrap()
@@ -421,9 +432,66 @@ static LEAN_BLOCK_BUILDING_FAILURES_TOTAL: std::sync::LazyLock<IntCounter> =
         register_int_counter!("lean_block_building_failures_total", "Failed block builds").unwrap()
     });
 
+// --- Block Proposal Attestation Selection (build_block fixed-point loop) ---
+
+static LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASE_SECONDS: std::sync::LazyLock<HistogramVec> =
+    std::sync::LazyLock::new(|| {
+        register_histogram_vec!(
+            "lean_block_proposal_attestation_build_phase_seconds",
+            "Phase-level time in block-proposal attestation selection: select_payloads (greedy \
+             per-AttestationData proof pick), compact (recursive merge of proofs per \
+             AttestationData), stf_simulate (candidate block state transition).",
+            &["phase"],
+            vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0
+            ]
+        )
+        .unwrap()
+    });
+
+static LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILDS_TOTAL: std::sync::LazyLock<IntCounter> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter!(
+            "lean_block_proposal_attestation_builds_total",
+            "Attestations selected during block-proposal selection (one increment per \
+             selection-loop round that picks an AttestationData)."
+        )
+        .unwrap()
+    });
+
+static LEAN_BLOCK_PROPOSAL_CHILD_PAYLOADS_CONSUMED_TOTAL: std::sync::LazyLock<IntCounter> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter!(
+            "lean_block_proposal_child_payloads_consumed_total",
+            "Child aggregated payloads selected during greedy proof picking (before compaction)."
+        )
+        .unwrap()
+    });
+
+static LEAN_BLOCK_PROPOSAL_ATTESTATION_DATA_SELECTED: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_block_proposal_attestation_data_selected",
+            "Distinct AttestationData entries in the proposal block body",
+            vec![0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0]
+        )
+        .unwrap()
+    });
+
+static LEAN_BLOCK_PROPOSAL_AGGREGATES_SELECTED: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_block_proposal_aggregates_selected",
+            "Aggregated signature proofs in the proposal result after compaction",
+            vec![0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0]
+        )
+        .unwrap()
+    });
+
 // --- Sync Status ---
 
 /// Node synchronization status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncStatus {
     Idle,
     Syncing,
@@ -445,6 +513,33 @@ impl SyncStatus {
 static LEAN_NODE_SYNC_STATUS: std::sync::LazyLock<IntGaugeVec> = std::sync::LazyLock::new(|| {
     register_int_gauge_vec!("lean_node_sync_status", "Node sync status", &["status"]).unwrap()
 });
+
+// --- Aggregator Skips ---
+
+/// Cross-client label set for `lean_aggregator_skipped_total` (leanMetrics).
+///
+/// `not_synced`, `missing_state` and `spawn_failed` never fire in ethlambda
+/// today: aggregation is not gated on sync status, needs no per-target
+/// pre-state resolution, and the `spawn_blocking` worker cannot fail to
+/// start. They are seeded at zero so fleet-wide dashboards see the full
+/// series.
+const AGGREGATOR_SKIP_REASONS: &[&str] = &[
+    "not_aggregator",
+    "not_synced",
+    "missing_state",
+    "spawn_failed",
+    "other",
+];
+
+static LEAN_AGGREGATOR_SKIPPED_TOTAL: std::sync::LazyLock<IntCounterVec> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter_vec!(
+            "lean_aggregator_skipped_total",
+            "Aggregation submissions skipped, by reason",
+            &["reason"]
+        )
+        .unwrap()
+    });
 
 // --- Initialization ---
 
@@ -513,8 +608,21 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_BLOCK_BUILDING_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_BLOCK_BUILDING_SUCCESS_TOTAL);
     std::sync::LazyLock::force(&LEAN_BLOCK_BUILDING_FAILURES_TOTAL);
+    // Block proposal attestation selection
+    std::sync::LazyLock::force(&LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASE_SECONDS);
+    std::sync::LazyLock::force(&LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILDS_TOTAL);
+    std::sync::LazyLock::force(&LEAN_BLOCK_PROPOSAL_CHILD_PAYLOADS_CONSUMED_TOTAL);
+    std::sync::LazyLock::force(&LEAN_BLOCK_PROPOSAL_ATTESTATION_DATA_SELECTED);
+    std::sync::LazyLock::force(&LEAN_BLOCK_PROPOSAL_AGGREGATES_SELECTED);
     // Sync status
     std::sync::LazyLock::force(&LEAN_NODE_SYNC_STATUS);
+    // Aggregator skip counter: instantiate every cross-client reason so the
+    // full series is visible from startup, including reasons ethlambda
+    // never fires.
+    std::sync::LazyLock::force(&LEAN_AGGREGATOR_SKIPPED_TOTAL);
+    for &reason in AGGREGATOR_SKIP_REASONS {
+        LEAN_AGGREGATOR_SKIPPED_TOTAL.with_label_values(&[reason]);
+    }
 }
 
 // --- Public API ---
@@ -652,6 +760,23 @@ pub fn observe_committee_signatures_aggregation(elapsed: std::time::Duration) {
     LEAN_COMMITTEE_SIGNATURES_AGGREGATION_TIME_SECONDS.observe(elapsed.as_secs_f64());
 }
 
+/// One aggregation cycle (interval-2 tick) skipped because this node has no
+/// aggregation duty. Bookkeeping label that lets dashboards separate "no
+/// duty" from genuine misses.
+pub fn inc_aggregator_skipped_not_aggregator() {
+    LEAN_AGGREGATOR_SKIPPED_TOTAL
+        .with_label_values(&["not_aggregator"])
+        .inc();
+}
+
+/// Aggregation jobs dropped without being attempted, e.g. because the
+/// session deadline cancelled the worker before it reached them.
+pub fn inc_aggregator_skipped_other(count: u64) {
+    LEAN_AGGREGATOR_SKIPPED_TOTAL
+        .with_label_values(&["other"])
+        .inc_by(count);
+}
+
 /// Update a table byte size gauge.
 pub fn update_table_bytes(table_name: &str, bytes: u64) {
     LEAN_TABLE_BYTES
@@ -738,6 +863,34 @@ pub fn inc_block_building_success() {
 /// Increment the failed block builds counter.
 pub fn inc_block_building_failures() {
     LEAN_BLOCK_BUILDING_FAILURES_TOTAL.inc();
+}
+
+/// Observe the duration of a block-proposal attestation-selection phase.
+/// `phase` must be one of [`BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASES`].
+pub fn observe_block_proposal_phase(phase: &str, elapsed: Duration) {
+    LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASE_SECONDS
+        .with_label_values(&[phase])
+        .observe(elapsed.as_secs_f64());
+}
+
+/// Increment the completed block-proposal attestation selection runs counter.
+pub fn inc_block_proposal_attestation_builds() {
+    LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILDS_TOTAL.inc();
+}
+
+/// Increment the greedily-selected child payloads counter (before compaction).
+pub fn inc_block_proposal_child_payloads_consumed(count: u64) {
+    LEAN_BLOCK_PROPOSAL_CHILD_PAYLOADS_CONSUMED_TOTAL.inc_by(count);
+}
+
+/// Observe the number of distinct `AttestationData` entries in the proposal block body.
+pub fn observe_block_proposal_attestation_data_selected(count: usize) {
+    LEAN_BLOCK_PROPOSAL_ATTESTATION_DATA_SELECTED.observe(count as f64);
+}
+
+/// Observe the number of aggregated signature proofs in the proposal result after compaction.
+pub fn observe_block_proposal_aggregates_selected(count: usize) {
+    LEAN_BLOCK_PROPOSAL_AGGREGATES_SELECTED.observe(count as f64);
 }
 
 /// Set the node sync status. Sets the given status label to 1 and all others to 0.

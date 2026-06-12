@@ -61,6 +61,22 @@ fn cov_record(section: &str, seen: &[bool], has_subnet: &[bool]) {
         "combined",
         seen.iter().filter(|&&b| b).count() as i64,
     );
+    let cc = has_subnet.len();
+    if cc > 0 {
+        let mut subnet_counts = vec![0i64; cc];
+        for (vid, &was_seen) in seen.iter().enumerate() {
+            if was_seen {
+                subnet_counts[vid % cc] += 1;
+            }
+        }
+        for (i, &count) in subnet_counts.iter().enumerate() {
+            metrics::set_attestation_aggregate_coverage_validators(
+                section,
+                &format!("subnet_{i}"),
+                count,
+            );
+        }
+    }
     metrics::set_attestation_aggregate_coverage_subnets(
         section,
         has_subnet.iter().filter(|&&b| b).count() as i64,

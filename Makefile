@@ -1,4 +1,4 @@
-.PHONY: help fmt lint docker-build run-devnet test docs docs-deps docs-serve
+.PHONY: help fmt lint docker-build shadow-build shadow-docker-build run-devnet test docs docs-deps docs-serve
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -24,27 +24,37 @@ docker-build: ## 🐳 Build the Docker image
 		-t ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG) .
 	@echo
 
-# 2026-05-17
-LEAN_SPEC_COMMIT_HASH:=f12000bd68a9640cffdfbd9a07503c9112d32bee
+shadow-build: ## 👻 Build a Shadow-simulator-compatible binary (single-threaded, no jemalloc)
+	./shadow/build.sh cargo build --release --no-default-features --features shadow-integration --bin ethlambda
 
-leanSpec:
-	git clone https://github.com/leanEthereum/leanSpec.git --single-branch
-	cd leanSpec && git checkout $(LEAN_SPEC_COMMIT_HASH)
+shadow-docker-build: ## 👻🐳 Build a Shadow-compatible Docker image
+	docker build \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg GIT_BRANCH=$(GIT_BRANCH) \
+		--build-arg SHADOW=1 \
+		--build-arg FEATURES=shadow-integration \
+		--build-arg NO_DEFAULT_FEATURES=--no-default-features \
+		--build-arg LOCKED= \
+		-t ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG)-shadow .
+	@echo
 
-# Pre-download the prod keys ourselves before `fill`. The pinned leanSpec
-# commit predates leanSpec PR #745, whose `download_keys` reads the still-open
-# (unflushed) download tempfile, intermittently truncating the gzip tail and
-# aborting with EOFError. A plain curl+tar fully writes the archive before
-# reading it, sidestepping the bug. `fill` then sees the keys already present
-# and skips its own download. Remove once the pin moves past PR #745.
-leanSpec/fixtures: leanSpec
-	cd leanSpec && \
-		KEYS_URL=$$(uv run python -c "from consensus_testing.keys import KEY_DOWNLOAD_URLS; print(KEY_DOWNLOAD_URLS['prod'])") && \
-		KEYS_DIR=packages/testing/src/consensus_testing/test_keys && \
-		mkdir -p $$KEYS_DIR && \
-		curl -sSL "$$KEYS_URL" -o /tmp/prod_scheme.tar.gz && \
-		tar -xzf /tmp/prod_scheme.tar.gz -C $$KEYS_DIR && \
-		uv run fill --fork Lstar -n auto --scheme prod -o fixtures
+LEAN_SPEC_FIXTURES_URL ?= https://github.com/leanEthereum/leanSpec/releases/latest/download/fixtures-prod-scheme.tar.gz
+LEAN_SPEC_FIXTURES_SHA_URL ?= $(LEAN_SPEC_FIXTURES_URL).sha256
+
+leanSpec/fixtures:
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	curl -L -f -o "$$tmpdir/fixtures-prod-scheme.tar.gz" "$(LEAN_SPEC_FIXTURES_URL)"; \
+	curl -L -f -o "$$tmpdir/fixtures-prod-scheme.tar.gz.sha256" "$(LEAN_SPEC_FIXTURES_SHA_URL)"; \
+	expected=$$(cut -d' ' -f1 "$$tmpdir/fixtures-prod-scheme.tar.gz.sha256"); \
+	actual=$$(sha256sum "$$tmpdir/fixtures-prod-scheme.tar.gz" | awk '{print $$1}'); \
+	if [ "$$expected" != "$$actual" ]; then \
+		echo "SHA256 mismatch: expected $$expected, got $$actual" >&2; \
+		exit 1; \
+	fi; \
+	rm -rf leanSpec/fixtures; \
+	mkdir -p leanSpec/fixtures; \
+	tar -xzf "$$tmpdir/fixtures-prod-scheme.tar.gz" -C leanSpec/fixtures --strip-components=1
 
 lean-quickstart:
 	git clone https://github.com/blockblaz/lean-quickstart.git --depth 1 --single-branch
