@@ -96,6 +96,14 @@ impl SyncStatusTracker {
             metrics::SyncStatus::Synced
         }
     }
+
+    fn duties_allowed(&self) -> bool {
+        !self.syncing
+    }
+
+    fn gate_proposer(&self, proposer: Option<u64>) -> Option<u64> {
+        proposer.filter(|_| self.duties_allowed())
+    }
 }
 
 /// Milliseconds until the next interval boundary, measured relative to genesis.
@@ -273,9 +281,16 @@ impl BlockChainServer {
         // At interval 0, check if we will propose (but don't build the block yet).
         // Tick forkchoice first to accept attestations, then build the block
         // using the freshly-accepted attestations.
-        let proposer_validator_id = (interval == 0 && slot > 0)
+        let scheduled_proposer = (interval == 0 && slot > 0)
             .then(|| self.get_our_proposer(slot))
             .flatten();
+        let proposer_validator_id = self.sync_status.gate_proposer(scheduled_proposer);
+
+        if let Some(validator_id) = scheduled_proposer
+            && proposer_validator_id.is_none()
+        {
+            info!(%slot, %validator_id, "Skipping block proposal while syncing");
+        }
 
         // Snapshot the pre-merge `new_payloads` set at the end-of-slot promote
         // (interval 4), so the post-block report for this round sees its
@@ -334,7 +349,11 @@ impl BlockChainServer {
                     slot - 1,
                 );
             }
-            self.produce_attestations(slot, is_aggregator);
+            if self.sync_status.duties_allowed() {
+                self.produce_attestations(slot, is_aggregator);
+            } else if !self.key_manager.validator_ids().is_empty() {
+                info!(%slot, "Skipping attestations while syncing");
+            }
         }
 
         // Update safe target slot metric (updated by store.on_tick at interval 3)
@@ -1068,6 +1087,12 @@ mod tests {
                 metrics::SyncStatus::Synced
             );
         }
+
+        let first_syncing_slot = 10 + SYNC_LAG_THRESHOLD + 1;
+        assert_eq!(
+            tracker.update(first_syncing_slot, 10, first_syncing_slot),
+            metrics::SyncStatus::Syncing
+        );
     }
 
     #[test]
@@ -1111,5 +1136,33 @@ mod tests {
         let mut tracker = SyncStatusTracker::default();
 
         assert_eq!(tracker.update(15, 20, 20), metrics::SyncStatus::Synced);
+    }
+
+    #[test]
+    fn syncing_gates_proposals_and_attestations() {
+        let mut tracker = SyncStatusTracker::default();
+        tracker.update(20, 0, 20);
+
+        assert!(!tracker.duties_allowed());
+        assert_eq!(tracker.gate_proposer(Some(3)), None);
+    }
+
+    #[test]
+    fn caught_up_node_allows_proposals_and_attestations() {
+        let mut tracker = SyncStatusTracker::default();
+        tracker.update(20, 0, 20);
+        tracker.update(20, 18, 20);
+
+        assert!(tracker.duties_allowed());
+        assert_eq!(tracker.gate_proposer(Some(3)), Some(3));
+    }
+
+    #[test]
+    fn network_stall_keeps_proposals_and_attestations_enabled() {
+        let mut tracker = SyncStatusTracker::default();
+        tracker.update(100, 0, 0);
+
+        assert!(tracker.duties_allowed());
+        assert_eq!(tracker.gate_proposer(Some(3)), Some(3));
     }
 }
