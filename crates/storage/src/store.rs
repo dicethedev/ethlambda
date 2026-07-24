@@ -920,6 +920,13 @@ impl Store {
 
     // ============ Blocks ============
 
+    /// `BlockRoots` index diff between the branch ending at `old_root` and the one
+    /// ending at `new_root`: slot keys to delete (canonical only on the old branch)
+    /// and slot -> root entries to write (canonical on the new branch).
+    ///
+    /// Both branches must be walkable down to their common ancestor. A root with no
+    /// header, genesis' zero parent included, means they have none in common, and
+    /// yields [`Error::UnexpectedMissingBlockHeader`] instead of a partial diff.
     fn block_root_index_changes(
         &self,
         mut old_root: H256,
@@ -928,62 +935,27 @@ impl Store {
         let mut deletes = Vec::new();
         let mut entries = Vec::new();
 
+        let mut old_header = self
+            .get_block_header(&old_root)?
+            .ok_or(Error::UnexpectedMissingBlockHeader(old_root))?;
+        let mut new_header = self
+            .get_block_header(&new_root)?
+            .ok_or(Error::UnexpectedMissingBlockHeader(new_root))?;
+
+        // Walk both branches back toward their common ancestor, until we find the common ancestor.
         while old_root != new_root {
-            if old_root.is_zero() {
-                let Some(header) = self.get_block_header(&new_root)? else {
-                    warn!(
-                        ?new_root,
-                        "Skipping block root index update for missing new head header"
-                    );
-                    break;
-                };
-                entries.push((encode_block_root_key(header.slot), new_root.to_ssz()));
-                new_root = header.parent_root;
-                continue;
-            }
-            if new_root.is_zero() {
-                let Some(header) = self.get_block_header(&old_root)? else {
-                    warn!(
-                        ?old_root,
-                        "Skipping block root index update for missing old head header"
-                    );
-                    break;
-                };
-                deletes.push(encode_block_root_key(header.slot));
-                old_root = header.parent_root;
-                continue;
-            }
-
-            let Some(old_header) = self.get_block_header(&old_root)? else {
-                warn!(
-                    ?old_root,
-                    "Skipping block root index update for missing old head header"
-                );
-                break;
-            };
-            let Some(new_header) = self.get_block_header(&new_root)? else {
-                warn!(
-                    ?new_root,
-                    "Skipping block root index update for missing new head header"
-                );
-                break;
-            };
-
-            match old_header.slot.cmp(&new_header.slot) {
-                std::cmp::Ordering::Greater => {
-                    deletes.push(encode_block_root_key(old_header.slot));
-                    old_root = old_header.parent_root;
-                }
-                std::cmp::Ordering::Less => {
-                    entries.push((encode_block_root_key(new_header.slot), new_root.to_ssz()));
-                    new_root = new_header.parent_root;
-                }
-                std::cmp::Ordering::Equal => {
-                    deletes.push(encode_block_root_key(old_header.slot));
-                    entries.push((encode_block_root_key(new_header.slot), new_root.to_ssz()));
-                    old_root = old_header.parent_root;
-                    new_root = new_header.parent_root;
-                }
+            if old_header.slot < new_header.slot {
+                entries.push((encode_block_root_key(new_header.slot), new_root.to_ssz()));
+                new_root = new_header.parent_root;
+                new_header = self
+                    .get_block_header(&new_root)?
+                    .ok_or(Error::UnexpectedMissingBlockHeader(new_root))?;
+            } else {
+                deletes.push(encode_block_root_key(old_header.slot));
+                old_root = old_header.parent_root;
+                old_header = self
+                    .get_block_header(&old_root)?
+                    .ok_or(Error::UnexpectedMissingBlockHeader(old_root))?;
             }
         }
 
