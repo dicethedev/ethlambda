@@ -699,6 +699,7 @@ fn on_block_core(
     store
         .insert_state(block_root, post_state)
         .expect("DB insert should succeed");
+    store.insert_known_attestation_votes(&block.body.attestations);
 
     // Block-included attestations are intentionally not counted here.
     // `lean_attestations_valid_total` tracks the gossip validation pipeline
