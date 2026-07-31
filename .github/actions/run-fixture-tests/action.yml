@@ -1,0 +1,114 @@
+name: "Run fixture-based tests"
+description: >-
+  Fetches the latest leanSpec test fixtures (cached by release SHA), sets up the
+  Rust toolchain, and runs the workspace test suite via `make test`. Assumes the
+  repository has already been checked out by the caller.
+
+runs:
+  using: "composite"
+  steps:
+    - name: Get leanSpec fixtures release info
+      id: fixtures-release
+      shell: bash
+      env:
+        # Authenticate the API call: unauthenticated requests share the runner
+        # IP's low rate-limit pool, which is the usual cause of transient failures.
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        api_url="https://api.github.com/repos/leanEthereum/leanSpec/releases/latest"
+
+        # -f fails on HTTP errors (so an error body is never captured as data) and
+        # --retry rides out transient network/5xx hiccups. Fail loudly, since a
+        # command substitution in an assignment does not trip `set -e` on its own.
+        json=$(curl -sSL -f --retry 5 --retry-all-errors \
+          -H "Accept: application/vnd.github+json" \
+          -H "Authorization: Bearer $GH_TOKEN" \
+          "$api_url") \
+          || { echo "::error::Failed to fetch leanSpec latest release metadata from $api_url"; exit 1; }
+
+        asset_url() {
+          echo "$json" | python3 -c \
+            "import sys,json; name=sys.argv[1]; j=json.load(sys.stdin); print(next(a['browser_download_url'] for a in j.get('assets',[]) if a.get('name')==name))" \
+            "$1"
+        }
+        fixtures_url=$(asset_url "fixtures-prod-scheme.tar.gz") \
+          || { echo "::error::Release is missing the fixtures-prod-scheme.tar.gz asset"; exit 1; }
+        sha_url=$(asset_url "fixtures-prod-scheme.tar.gz.sha256") \
+          || { echo "::error::Release is missing the fixtures-prod-scheme.tar.gz.sha256 asset"; exit 1; }
+
+        sha=$(curl -sSL -f --retry 5 --retry-all-errors "$sha_url" | cut -d' ' -f1) \
+          || { echo "::error::Failed to download the fixtures checksum from $sha_url"; exit 1; }
+
+        # Validate before writing: a transient HTML error page captured as $sha
+        # previously corrupted $GITHUB_OUTPUT ("Invalid format '<!--'").
+        if [[ ! "$sha" =~ ^[0-9a-fA-F]{64}$ ]]; then
+          echo "::error::Expected a 64-char hex SHA256 for the fixtures archive, got: '$sha'"
+          exit 1
+        fi
+
+        {
+          echo "url=$fixtures_url"
+          echo "sha_url=$sha_url"
+          echo "sha=$sha"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Restore test fixtures cache
+      id: cache-fixtures
+      uses: actions/cache/restore@v5
+      with:
+        path: leanSpec/fixtures
+        key: leanspec-fixtures-${{ steps.fixtures-release.outputs.sha }}
+
+    - name: Download leanSpec fixtures release
+      id: download-fixtures
+      if: steps.cache-fixtures.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        tmpdir=$(mktemp -d)
+        trap 'rm -rf "$tmpdir"' EXIT
+        fixtures_url="${{ steps.fixtures-release.outputs.url }}"
+        sha_url="${{ steps.fixtures-release.outputs.sha_url }}"
+        echo "Downloading fixtures from $fixtures_url"
+        curl -L -f --retry 5 --retry-all-errors -o "$tmpdir/fixtures-prod-scheme.tar.gz" "$fixtures_url"
+        curl -L -f --retry 5 --retry-all-errors -o "$tmpdir/fixtures-prod-scheme.tar.gz.sha256" "$sha_url"
+        expected=$(cut -d' ' -f1 "$tmpdir/fixtures-prod-scheme.tar.gz.sha256")
+        actual=$(sha256sum "$tmpdir/fixtures-prod-scheme.tar.gz" | awk '{print $1}')
+        if [ "$expected" != "$actual" ]; then
+          echo "SHA256 mismatch: expected $expected, got $actual"
+          exit 1
+        fi
+        rm -rf leanSpec/fixtures
+        mkdir -p leanSpec/fixtures
+        tar -xzf "$tmpdir/fixtures-prod-scheme.tar.gz" -C leanSpec/fixtures --strip-components=1
+
+    # Save fixtures only when the download actually SUCCEEDED, so a
+    # cancelled or failed download never persists a partial fixture set,
+    # while still saving even if the later Rust test step fails.
+    - name: Save test fixtures cache
+      if: >-
+        always()
+        && steps.cache-fixtures.outputs.cache-hit != 'true'
+        && steps.download-fixtures.outcome == 'success'
+      uses: actions/cache/save@v5
+      with:
+        path: leanSpec/fixtures
+        key: ${{ steps.cache-fixtures.outputs.cache-primary-key }}
+
+    # Ensure make sees fixtures as up-to-date (its timestamp must be
+    # newer than leanSpec/, which intermediate steps may have modified).
+    - name: Mark fixtures as up-to-date
+      shell: bash
+      run: touch leanSpec/fixtures
+
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: "1.97.1"
+
+    - name: Setup cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Run tests
+      shell: bash
+      run: make test

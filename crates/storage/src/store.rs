@@ -1,19 +1,25 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::num::NonZeroUsize;
 use std::sync::{Arc, LazyLock, Mutex};
 
-use crate::api::{StorageBackend, StorageWriteBatch, Table};
+use lru::LruCache;
 
+use crate::api::{StorageBackend, StorageReadView, StorageWriteBatch, Table};
+use crate::error::Error;
+
+use ethlambda_crypto::signature::ValidatorSignature;
 use ethlambda_types::{
     attestation::{AggregationBits, AttestationData, HashedAttestationData, bits_is_subset},
     block::{
-        Block, BlockBody, BlockHeader, MultiMessageAggregate, SignedBlock, TypeOneMultiSignature,
+        Block, BlockBody, BlockHeader, MultiMessageAggregate, SignedBlock, SingleMessageAggregate,
     },
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
-    signature::ValidatorSignature,
     state::{ChainConfig, State, anchor_pair_is_consistent},
 };
 use libssz::{SszDecode, SszEncode};
+
+use crate::state_diff::StateDiff;
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -83,19 +89,30 @@ const KEY_LATEST_JUSTIFIED: &[u8] = b"latest_justified";
 /// Key for "latest_finalized" field of the Store. Its value has type [`Checkpoint`] and it's SSZ-encoded.
 const KEY_LATEST_FINALIZED: &[u8] = b"latest_finalized";
 
-/// ~1 day of block history at 4-second slots (86400 / 4 = 21600).
-const BLOCKS_TO_KEEP: usize = 21_600;
+/// Persist a full-state snapshot whenever a block's slot crosses a multiple of
+/// this value (relative to its parent's slot).
+///
+/// Snapshots are the only entries written to `States` (plus the bootstrap
+/// anchor); they are never pruned and bound state-reconstruction diff walks to
+/// at most this many steps. ~68 minutes at 4-second slots.
+const SNAPSHOT_ANCHOR_INTERVAL: u64 = 1_024;
 
-/// ~3.3 hours of state history at 4-second slots (12000 / 4 = 3000).
-const STATES_TO_KEEP: usize = 3_000;
+/// Number of reconstructed/imported states memoized in memory.
+///
+/// States are content-addressed by block root and immutable, so the cache never
+/// needs invalidation; it only bounds how many recent states stay hot for reads
+/// (e.g. a block's `parent_state` right after import). A miss falls back to a
+/// snapshot read or a diff-chain reconstruction.
+const STATE_CACHE_CAPACITY: usize = 32;
+
+/// Keep block signatures for at least this many slots below the tip, even once
+/// finalized. Signatures older than this window are pruned only when the window
+/// lies entirely within finalized history; see [`Store::prune_old_block_signatures`].
+/// ~1 day at 4-second slots.
+const SIGNATURE_PRUNING_RANGE: u64 = 21_600;
 
 /// ~30 minutes of resume window at 4-second slots (1800 / 4 = 450).
 pub const MAX_RESUMABLE_DB_STATE_AGE: u64 = 450;
-
-const _: () = assert!(
-    BLOCKS_TO_KEEP >= STATES_TO_KEEP,
-    "BLOCKS_TO_KEEP must be >= STATES_TO_KEEP"
-);
 
 /// Hard cap for the known aggregated payload buffer (number of distinct attestation messages).
 /// With 1 attestation/slot, this holds ~500 messages (~33 min at 4s/slot).
@@ -114,14 +131,14 @@ const GOSSIP_SIGNATURE_CAP: usize = 2048;
 #[derive(Clone)]
 struct PayloadEntry {
     data: AttestationData,
-    proofs: Vec<TypeOneMultiSignature>,
+    proofs: Vec<SingleMessageAggregate>,
 }
 
 /// Fixed-size circular buffer for aggregated payloads.
 ///
 /// Groups proofs by attestation data (via data_root). Each distinct
 /// attestation message stores the full `AttestationData` plus all
-/// `TypeOneMultiSignature`s covering that message.
+/// `SingleMessageAggregate`s covering that message.
 ///
 /// Entries are evicted FIFO (by insertion order of the data_root)
 /// when the buffer reaches capacity.
@@ -152,7 +169,7 @@ impl PayloadBuffer {
     ///   any existing proof, the incoming proof is redundant and skipped.
     /// - Otherwise, any existing proof whose participants are a strict subset
     ///   of the incoming proof's is removed before inserting.
-    fn push(&mut self, hashed: HashedAttestationData, proof: TypeOneMultiSignature) {
+    fn push(&mut self, hashed: HashedAttestationData, proof: SingleMessageAggregate) {
         let (data_root, att_data) = hashed.into_parts();
 
         if let Some(entry) = self.data.get_mut(&data_root) {
@@ -201,7 +218,7 @@ impl PayloadBuffer {
     }
 
     /// Insert a batch of (hashed_attestation_data, proof) entries.
-    fn push_batch(&mut self, entries: Vec<(HashedAttestationData, TypeOneMultiSignature)>) {
+    fn push_batch(&mut self, entries: Vec<(HashedAttestationData, SingleMessageAggregate)>) {
         for (hashed, proof) in entries {
             self.push(hashed, proof);
         }
@@ -211,9 +228,11 @@ impl PayloadBuffer {
     ///
     /// Drains in insertion order (via `self.order`) so downstream consumers
     /// like `promote_new_aggregated_payloads` re-insert into known_payloads
-    /// deterministically. HashMap iteration would be RandomState-seeded and
-    /// produce non-deterministic vote ordering for same-slot equivocation.
-    fn drain(&mut self) -> Vec<(HashedAttestationData, TypeOneMultiSignature)> {
+    /// deterministically; `self.data` iteration alone would be RandomState-seeded.
+    /// (Fork-choice vote extraction no longer depends on this order: it resolves
+    /// same-slot equivocation by canonical attestation-data root, see
+    /// `extract_latest_attestations`.)
+    fn drain(&mut self) -> Vec<(HashedAttestationData, SingleMessageAggregate)> {
         self.total_proofs = 0;
         let mut result = Vec::with_capacity(self.data.values().map(|e| e.proofs.len()).sum());
         while let Some(data_root) = self.order.pop_front() {
@@ -237,7 +256,7 @@ impl PayloadBuffer {
     }
 
     /// Return cloned proofs for a given data_root, or empty vec if none.
-    fn proofs_for_root(&self, data_root: &H256) -> Vec<TypeOneMultiSignature> {
+    fn proofs_for_root(&self, data_root: &H256) -> Vec<SingleMessageAggregate> {
         self.data
             .get(data_root)
             .map_or_else(Vec::new, |e| e.proofs.clone())
@@ -279,26 +298,23 @@ impl PayloadBuffer {
 
     /// Extract per-validator latest attestations from proofs' participation bits.
     ///
-    /// Iterates entries in insertion order (via `self.order`) so that, when two
-    /// aggregations carry the same `slot` but disagree on the target (an
-    /// equivocation by the shared validators), the first-observed aggregation
-    /// wins. The ethrex spec relies on Python dict insertion-order semantics
-    /// here; iterating `self.data.values()` would be RandomState-seeded and
-    /// fail the equivocation fork-choice tests non-deterministically.
+    /// An equivocator can cast two distinct votes at the same `slot`. To keep the
+    /// extracted head a pure function of pool contents (independent of arrival or
+    /// insertion order), votes are processed newest-first with an equal-slot tie
+    /// broken toward the larger canonical attestation-data root — the same rule the
+    /// block-level fork-choice tiebreak applies to block roots (leanSpec #1181). The
+    /// pool key is already `hash_tree_root(data)`, so the tie needs no extra hashing.
     fn extract_latest_attestations(&self) -> HashMap<u64, AttestationData> {
+        let mut ordered: Vec<(&H256, &PayloadEntry)> = self.data.iter().collect();
+        // Descending by (slot, data_root): the larger tuple is the canonical winner.
+        ordered.sort_unstable_by(|a, b| (b.1.data.slot, b.0).cmp(&(a.1.data.slot, a.0)));
+
         let mut result: HashMap<u64, AttestationData> = HashMap::new();
-        for data_root in &self.order {
-            let Some(entry) = self.data.get(data_root) else {
-                continue;
-            };
+        for (_data_root, entry) in ordered {
             for proof in &entry.proofs {
                 for vid in proof.participant_indices() {
-                    let should_update = result
-                        .get(&vid)
-                        .is_none_or(|existing| existing.slot < entry.data.slot);
-                    if should_update {
-                        result.insert(vid, entry.data.clone());
-                    }
+                    // Descending order means the first vote seen for a validator wins.
+                    result.entry(vid).or_insert_with(|| entry.data.clone());
                 }
             }
         }
@@ -319,6 +335,10 @@ struct GossipDataEntry {
 
 /// Gossip signatures snapshot: (hashed_attestation_data, Vec<(validator_id, signature)>).
 pub type GossipSignatureSnapshot = Vec<(HashedAttestationData, Vec<(u64, ValidatorSignature)>)>;
+
+type StorageKey = Vec<u8>;
+type StorageEntry = (StorageKey, Vec<u8>);
+type BlockRootIndexChanges = (Vec<StorageKey>, Vec<StorageEntry>);
 
 /// Bounded buffer for gossip signatures with FIFO eviction.
 ///
@@ -447,6 +467,39 @@ impl GossipSignatureBuffer {
             .collect()
     }
 
+    /// Largest signature count among data groups whose attestation slot is `slot`.
+    fn max_group_count_for_slot(&self, slot: u64) -> usize {
+        self.data
+            .values()
+            .filter(|entry| entry.data.slot == slot)
+            .map(|entry| entry.signatures.len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Extract per-validator latest attestations from the raw signature pool.
+    ///
+    /// Mirrors `PayloadBuffer::extract_latest_attestations`: votes are processed
+    /// newest-first with an equal-slot tie broken toward the larger canonical
+    /// attestation-data root, so the extracted winner is independent of arrival or
+    /// insertion order (leanSpec #1181). This matches the leanSpec
+    /// `location == "signatures"` checker, which folds `attestation_signatures`
+    /// keeping each validator's canonical-precedence winner.
+    fn extract_latest_attestations(&self) -> HashMap<u64, AttestationData> {
+        let mut ordered: Vec<(&H256, &GossipDataEntry)> = self.data.iter().collect();
+        // Descending by (slot, data_root): the larger tuple is the canonical winner.
+        ordered.sort_unstable_by(|a, b| (b.1.data.slot, b.0).cmp(&(a.1.data.slot, a.0)));
+
+        let mut result: HashMap<u64, AttestationData> = HashMap::new();
+        for (_data_root, entry) in ordered {
+            for &vid in entry.signatures.keys() {
+                // Descending order means the first vote seen for a validator wins.
+                result.entry(vid).or_insert_with(|| entry.data.clone());
+            }
+        }
+        result
+    }
+
     /// Returns the total number of individual signatures stored.
     fn total_signatures(&self) -> usize {
         self.total_signatures
@@ -462,17 +515,21 @@ impl GossipSignatureBuffer {
 /// Encode a LiveChain key (slot, root) to bytes.
 /// Layout: slot (8 bytes big-endian) || root (32 bytes)
 /// Big-endian ensures lexicographic ordering matches numeric ordering.
-fn encode_live_chain_key(slot: u64, root: &H256) -> Vec<u8> {
+fn encode_slot_root_key(slot: u64, root: &H256) -> Vec<u8> {
     let mut result = slot.to_be_bytes().to_vec();
     result.extend_from_slice(&root.0);
     result
 }
 
-/// Decode a LiveChain key from bytes.
-fn decode_live_chain_key(bytes: &[u8]) -> (u64, H256) {
+/// Decode a slot||root key (LiveChain / BlockSignatures) from bytes.
+fn decode_slot_root_key(bytes: &[u8]) -> (u64, H256) {
     let slot = u64::from_be_bytes(bytes[..8].try_into().expect("valid slot bytes"));
     let root = H256::from_slice(&bytes[8..]);
     (slot, root)
+}
+
+fn encode_block_root_key(slot: u64) -> Vec<u8> {
+    slot.to_be_bytes().to_vec()
 }
 
 /// Fork choice store backed by a pluggable storage backend.
@@ -481,6 +538,7 @@ fn decode_live_chain_key(bytes: &[u8]) -> (u64, H256) {
 ///
 /// - **Metadata**: time, config, head, safe_target, justified/finalized checkpoints
 /// - **Blocks**: headers and bodies stored separately for efficient header-only queries
+/// - **BlockRoots**: canonical block roots indexed by slot
 /// - **States**: beacon states indexed by block root
 /// - **Attestations**: latest known and pending ("new") attestations per validator
 /// - **Signatures**: gossip signatures and aggregated proofs for signature verification
@@ -497,6 +555,15 @@ pub struct Store {
     known_payloads: Arc<Mutex<PayloadBuffer>>,
     /// In-memory gossip signatures, consumed at interval 2 aggregation.
     gossip_signatures: Arc<Mutex<GossipSignatureBuffer>>,
+    /// LRU memoization of states by block root, shared across `Store` clones.
+    /// Avoids reconstructing recent states from diffs on every read.
+    state_cache: Arc<Mutex<LruCache<H256, State>>>,
+}
+
+/// Build an empty state cache sized to [`STATE_CACHE_CAPACITY`].
+fn new_state_cache() -> Arc<Mutex<LruCache<H256, State>>> {
+    let capacity = NonZeroUsize::new(STATE_CACHE_CAPACITY).expect("cache capacity is non-zero");
+    Arc::new(Mutex::new(LruCache::new(capacity)))
 }
 
 impl Store {
@@ -506,6 +573,7 @@ impl Store {
     /// No block body is stored since it's not available.
     pub fn from_anchor_state(backend: Arc<dyn StorageBackend>, anchor_state: State) -> Self {
         Self::init_store(backend, anchor_state, None)
+            .expect("store initialization should succeed in from_anchor_state")
     }
 
     /// Initialize a Store from an anchor state and block.
@@ -530,11 +598,10 @@ impl Store {
             });
         }
 
-        Ok(Self::init_store(
-            backend,
-            anchor_state,
-            Some(anchor_block.body),
-        ))
+        Ok(
+            Self::init_store(backend, anchor_state, Some(anchor_block.body))
+                .expect("store initialization should succeed in get_forkchoice_store"),
+        )
     }
 
     /// Build a Store from the state already persisted in the storage backend.
@@ -544,13 +611,19 @@ impl Store {
     pub fn from_db_state(
         backend: Arc<dyn StorageBackend>,
         expected_genesis_time: u64,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>, Error> {
         let persisted_config = {
             let view = backend.begin_read().expect("read view");
-            let bytes = view.get(Table::Metadata, KEY_CONFIG).expect("get config")?;
-            // probe KEY_LATEST_FINALIZED
-            view.get(Table::Metadata, KEY_LATEST_FINALIZED)
-                .expect("get latest finalized")?;
+            let Some(bytes) = view.get(Table::Metadata, KEY_CONFIG).expect("get config") else {
+                return Ok(None);
+            };
+            if view
+                .get(Table::Metadata, KEY_LATEST_FINALIZED)
+                .expect("get latest finalized")
+                .is_none()
+            {
+                return Ok(None);
+            }
             ChainConfig::from_ssz_bytes(&bytes).expect("valid config")
         };
         if persisted_config.genesis_time != expected_genesis_time {
@@ -559,17 +632,19 @@ impl Store {
                 expected_genesis_time,
                 "Persisted DB has a different genesis_time; treating as empty"
             );
-            return None;
+            return Ok(None);
         }
-        info!("Loaded store from persisted DB state");
-        Some(Self {
+        let store = Self {
             backend,
             new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
             known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
             gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                 GOSSIP_SIGNATURE_CAP,
             ))),
-        })
+            state_cache: new_state_cache(),
+        };
+        info!("Loaded store from persisted DB state");
+        Ok(Some(store))
     }
 
     /// Internal helper to initialize the store with anchor data.
@@ -579,7 +654,7 @@ impl Store {
         backend: Arc<dyn StorageBackend>,
         mut anchor_state: State,
         anchor_body: Option<BlockBody>,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         // Save original state_root for validation
         let original_state_root = anchor_state.latest_block_header.state_root;
 
@@ -631,6 +706,16 @@ impl Store {
                 .put_batch(Table::BlockHeaders, header_entries)
                 .expect("put block header");
 
+            batch
+                .put_batch(
+                    Table::BlockRoots,
+                    vec![(
+                        encode_block_root_key(anchor_state.latest_block_header.slot),
+                        anchor_block_root.to_ssz(),
+                    )],
+                )
+                .expect("put block root index");
+
             // Block body (if provided)
             if let Some(body) = anchor_body {
                 let body_entries = vec![(anchor_block_root.to_ssz(), body.to_ssz())];
@@ -639,7 +724,9 @@ impl Store {
                     .expect("put block body");
             }
 
-            // State
+            // State snapshot. The anchor has no parent in the store, so it is
+            // the base of every diff chain: store it as a full snapshot in
+            // `States` (never pruned) so reconstruction always terminates here.
             let state_entries = vec![(anchor_block_root.to_ssz(), anchor_state.to_ssz())];
             batch
                 .put_batch(Table::States, state_entries)
@@ -647,7 +734,7 @@ impl Store {
 
             // Live chain index
             let index_entries = vec![(
-                encode_live_chain_key(anchor_state.latest_block_header.slot, &anchor_block_root),
+                encode_slot_root_key(anchor_state.latest_block_header.slot, &anchor_block_root),
                 anchor_state.latest_block_header.parent_root.to_ssz(),
             )];
             batch
@@ -659,33 +746,35 @@ impl Store {
 
         info!(%anchor_state_root, %anchor_block_root, "Initialized store");
 
-        Self {
+        Ok(Self {
             backend,
             new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
             known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
             gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                 GOSSIP_SIGNATURE_CAP,
             ))),
-        }
+            state_cache: new_state_cache(),
+        })
     }
 
     // ============ Metadata Helpers ============
 
-    fn get_metadata<T: SszDecode>(&self, key: &[u8]) -> T {
+    fn get_metadata<T: SszDecode>(&self, key: &[u8]) -> Result<T, Error> {
         let view = self.backend.begin_read().expect("read view");
         let bytes = view
             .get(Table::Metadata, key)
             .expect("get")
             .expect("metadata key exists");
-        T::from_ssz_bytes(&bytes).expect("valid encoding")
+        Ok(T::from_ssz_bytes(&bytes).expect("valid encoding"))
     }
 
-    fn set_metadata<T: SszEncode>(&self, key: &[u8], value: &T) {
+    fn set_metadata<T: SszEncode>(&self, key: &[u8], value: &T) -> Result<(), Error> {
         let mut batch = self.backend.begin_write().expect("write batch");
         batch
             .put_batch(Table::Metadata, vec![(key.to_vec(), value.to_ssz())])
             .expect("put metadata");
         batch.commit().expect("commit");
+        Ok(())
     }
 
     // ============ Time ============
@@ -695,50 +784,50 @@ impl Store {
     /// Each increment represents one 800ms interval. Derive slot/interval as:
     ///   slot     = time() / INTERVALS_PER_SLOT
     ///   interval = time() % INTERVALS_PER_SLOT
-    pub fn time(&self) -> u64 {
+    pub fn time(&self) -> Result<u64, Error> {
         self.get_metadata(KEY_TIME)
     }
 
     /// Sets the current store time.
-    pub fn set_time(&mut self, time: u64) {
-        self.set_metadata(KEY_TIME, &time);
+    pub fn set_time(&mut self, time: u64) -> Result<(), Error> {
+        self.set_metadata(KEY_TIME, &time)
     }
 
     // ============ Config ============
 
     /// Returns the chain configuration.
-    pub fn config(&self) -> ChainConfig {
+    pub fn config(&self) -> Result<ChainConfig, Error> {
         self.get_metadata(KEY_CONFIG)
     }
 
     // ============ Head ============
 
     /// Returns the current head block root.
-    pub fn head(&self) -> H256 {
+    pub fn head(&self) -> Result<H256, Error> {
         self.get_metadata(KEY_HEAD)
     }
 
     // ============ Safe Target ============
 
     /// Returns the safe target block root for attestations.
-    pub fn safe_target(&self) -> H256 {
+    pub fn safe_target(&self) -> Result<H256, Error> {
         self.get_metadata(KEY_SAFE_TARGET)
     }
 
     /// Sets the safe target block root.
-    pub fn set_safe_target(&mut self, safe_target: H256) {
-        self.set_metadata(KEY_SAFE_TARGET, &safe_target);
+    pub fn set_safe_target(&mut self, safe_target: H256) -> Result<(), Error> {
+        self.set_metadata(KEY_SAFE_TARGET, &safe_target)
     }
 
     // ============ Checkpoints ============
 
     /// Returns the latest justified checkpoint.
-    pub fn latest_justified(&self) -> Checkpoint {
+    pub fn latest_justified(&self) -> Result<Checkpoint, Error> {
         self.get_metadata(KEY_LATEST_JUSTIFIED)
     }
 
     /// Returns the latest finalized checkpoint.
-    pub fn latest_finalized(&self) -> Checkpoint {
+    pub fn latest_finalized(&self) -> Result<Checkpoint, Error> {
         self.get_metadata(KEY_LATEST_FINALIZED)
     }
 
@@ -751,9 +840,12 @@ impl Store {
     /// - Finalized is updated if provided.
     ///
     /// When finalization advances, prunes the LiveChain index.
-    pub fn update_checkpoints(&mut self, checkpoints: ForkCheckpoints) {
+    pub fn update_checkpoints(&mut self, checkpoints: ForkCheckpoints) -> Result<(), Error> {
         // Read old finalized slot before updating metadata
-        let old_finalized_slot = self.latest_finalized().slot;
+        let old_finalized_slot = self.latest_finalized()?.slot;
+        let old_head = self.head()?;
+        let (block_root_deletes, block_root_entries) =
+            self.block_root_index_changes(old_head, checkpoints.head)?;
 
         let mut entries = vec![(KEY_HEAD.to_vec(), checkpoints.head.to_ssz())];
 
@@ -767,6 +859,12 @@ impl Store {
 
         let mut batch = self.backend.begin_write().expect("write batch");
         batch.put_batch(Table::Metadata, entries).expect("put");
+        batch
+            .delete_batch(Table::BlockRoots, block_root_deletes)
+            .expect("delete old canonical block roots");
+        batch
+            .put_batch(Table::BlockRoots, block_root_entries)
+            .expect("put canonical block roots");
         batch.commit().expect("commit");
 
         // Lightweight pruning that should happen immediately on finalization advance:
@@ -776,8 +874,11 @@ impl Store {
         if let Some(finalized) = checkpoints.finalized
             && finalized.slot > old_finalized_slot
         {
-            let pruned_chain = self.prune_live_chain(finalized.slot);
+            let pruned_chain = self
+                .prune_live_chain(finalized.slot)
+                .expect("prune live chain");
             let pruned_sigs = self.prune_gossip_signatures(finalized.slot);
+
             let pruned_payloads = self.prune_stale_aggregated_payloads(finalized.slot);
 
             if pruned_chain > 0 || pruned_sigs > 0 || pruned_payloads > 0 {
@@ -787,69 +888,123 @@ impl Store {
                 );
             }
         }
+        Ok(())
     }
 
-    /// Prune old states and blocks to keep storage bounded.
+    /// Prune finalized block signatures to keep signature storage bounded.
+    ///
+    /// State diffs, block headers, block bodies, and full-state snapshots are
+    /// all retained for the full history and are never pruned. Only signatures
+    /// of finalized blocks older than the pruning window are removed.
     ///
     /// This is separated from `update_checkpoints` so callers can defer heavy
-    /// pruning until after a batch of blocks has been fully processed. Running
-    /// this mid-cascade would delete states that pending children still need,
-    /// causing infinite re-processing loops when fallback pruning is active.
-    pub fn prune_old_data(&mut self) {
-        let protected_roots = [
-            self.latest_finalized().root,
-            self.latest_justified().root,
-            self.head(),
-        ];
-        let pruned_states = self.prune_old_states(&protected_roots);
-        let pruned_blocks = self.prune_old_blocks(&protected_roots);
-        if pruned_states > 0 || pruned_blocks > 0 {
-            info!(pruned_states, pruned_blocks, "Pruned old states and blocks");
+    /// pruning until after a batch of blocks has been fully processed.
+    pub fn prune_old_data(&mut self) -> Result<(), Error> {
+        let finalized_slot = self
+            .latest_finalized()
+            .expect("Failed to get latest finalized checkpoint")
+            .slot;
+        let tip_slot = self
+            .get_block_header(&self.head().expect("Failed to get head block root"))
+            .map_or(finalized_slot, |header| {
+                header.expect("Failed to get block header").slot
+            });
+        let pruned_signatures = self
+            .prune_old_block_signatures(finalized_slot, tip_slot)
+            .expect("prune old block signatures");
+        if pruned_signatures > 0 {
+            info!(pruned_signatures, "Pruned old finalized block signatures");
         }
+        Ok(())
     }
 
     // ============ Blocks ============
+
+    /// `BlockRoots` index diff between the branch ending at `old_root` and the one
+    /// ending at `new_root`: slot keys to delete (canonical only on the old branch)
+    /// and slot -> root entries to write (canonical on the new branch).
+    ///
+    /// Both branches must be walkable down to their common ancestor. A root with no
+    /// header, genesis' zero parent included, means they have none in common, and
+    /// yields [`Error::UnexpectedMissingBlockHeader`] instead of a partial diff.
+    fn block_root_index_changes(
+        &self,
+        mut old_root: H256,
+        mut new_root: H256,
+    ) -> Result<BlockRootIndexChanges, Error> {
+        let mut deletes = Vec::new();
+        let mut entries = Vec::new();
+
+        let mut old_header = self
+            .get_block_header(&old_root)?
+            .ok_or(Error::UnexpectedMissingBlockHeader(old_root))?;
+        let mut new_header = self
+            .get_block_header(&new_root)?
+            .ok_or(Error::UnexpectedMissingBlockHeader(new_root))?;
+
+        // Walk both branches back toward their common ancestor, until we find the common ancestor.
+        while old_root != new_root {
+            if old_header.slot < new_header.slot {
+                entries.push((encode_block_root_key(new_header.slot), new_root.to_ssz()));
+                new_root = new_header.parent_root;
+                new_header = self
+                    .get_block_header(&new_root)?
+                    .ok_or(Error::UnexpectedMissingBlockHeader(new_root))?;
+            } else {
+                deletes.push(encode_block_root_key(old_header.slot));
+                old_root = old_header.parent_root;
+                old_header = self
+                    .get_block_header(&old_root)?
+                    .ok_or(Error::UnexpectedMissingBlockHeader(old_root))?;
+            }
+        }
+
+        Ok((deletes, entries))
+    }
 
     /// Get block data for fork choice: root -> (slot, parent_root).
     ///
     /// Iterates only the LiveChain table, avoiding Block deserialization.
     /// Returns only non-finalized blocks, automatically pruned on finalization.
-    pub fn get_live_chain(&self) -> HashMap<H256, (u64, H256)> {
+    pub fn get_live_chain(&self) -> Result<HashMap<H256, (u64, H256)>, Error> {
         let view = self.backend.begin_read().expect("read view");
-        view.prefix_iterator(Table::LiveChain, &[])
+        Ok(view
+            .prefix_iterator(Table::LiveChain, &[])
             .expect("iterator")
             .filter_map(|res| res.ok())
             .map(|(k, v)| {
-                let (slot, root) = decode_live_chain_key(&k);
+                let (slot, root) = decode_slot_root_key(&k);
                 let parent_root = H256::from_ssz_bytes(&v).expect("valid parent_root");
                 (root, (slot, parent_root))
             })
-            .collect()
+            .collect())
     }
 
     /// Return the highest slot in the live chain.
-    pub fn max_live_chain_slot(&self) -> Option<u64> {
+    pub fn max_live_chain_slot(&self) -> Result<Option<u64>, Error> {
         let view = self.backend.begin_read().expect("read view");
-        view.prefix_iterator(Table::LiveChain, &[])
+        Ok(view
+            .prefix_iterator(Table::LiveChain, &[])
             .expect("iterator")
             .filter_map(Result::ok)
-            .map(|(key, _)| decode_live_chain_key(&key).0)
-            .max()
+            .map(|(key, _)| decode_slot_root_key(&key).0)
+            .max())
     }
 
     /// Get all known block roots as HashSet.
     ///
     /// Useful for checking block existence without deserializing.
-    pub fn get_block_roots(&self) -> HashSet<H256> {
+    pub fn get_block_roots(&self) -> Result<HashSet<H256>, Error> {
         let view = self.backend.begin_read().expect("read view");
-        view.prefix_iterator(Table::LiveChain, &[])
+        Ok(view
+            .prefix_iterator(Table::LiveChain, &[])
             .expect("iterator")
             .filter_map(|res| res.ok())
             .map(|(k, _)| {
-                let (_, root) = decode_live_chain_key(&k);
+                let (_, root) = decode_slot_root_key(&k);
                 root
             })
-            .collect()
+            .collect())
     }
 
     /// Prune slot index entries with slot < finalized_slot.
@@ -858,7 +1013,7 @@ impl Store {
     /// LiveChain index is pruned.
     ///
     /// Returns the number of entries pruned.
-    pub fn prune_live_chain(&mut self, finalized_slot: u64) -> usize {
+    pub fn prune_live_chain(&mut self, finalized_slot: u64) -> Result<usize, Error> {
         let view = self.backend.begin_read().expect("read view");
 
         // Collect keys to delete - stop once we hit finalized_slot
@@ -868,7 +1023,7 @@ impl Store {
             .expect("iterator")
             .filter_map(|res| res.ok())
             .take_while(|(k, _)| {
-                let (slot, _) = decode_live_chain_key(k);
+                let (slot, _) = decode_slot_root_key(k);
                 slot < finalized_slot
             })
             .map(|(k, _)| k.to_vec())
@@ -877,7 +1032,7 @@ impl Store {
 
         let count = keys_to_delete.len();
         if count == 0 {
-            return 0;
+            return Ok(0);
         }
 
         let mut batch = self.backend.begin_write().expect("write batch");
@@ -885,7 +1040,7 @@ impl Store {
             .delete_batch(Table::LiveChain, keys_to_delete)
             .expect("delete non-finalized chain entries");
         batch.commit().expect("commit");
-        count
+        Ok(count)
     }
 
     /// Prune gossip signatures for slots <= finalized_slot.
@@ -908,115 +1063,65 @@ impl Store {
         pruned_new + pruned_known
     }
 
-    /// Prune old states beyond the retention window.
+    /// Prune signatures of old finalized blocks, keeping a recent window.
     ///
-    /// Keeps the most recent `STATES_TO_KEEP` states (by slot), plus any
-    /// states whose roots appear in `protected_roots` (finalized, justified).
+    /// Signatures within [`SIGNATURE_PRUNING_RANGE`] slots of `tip_slot` are
+    /// always kept, as are all signatures of non-finalized blocks. Concretely,
+    /// with `cutoff = tip_slot - SIGNATURE_PRUNING_RANGE`:
     ///
-    /// Returns the number of states pruned.
-    pub fn prune_old_states(&mut self, protected_roots: &[H256]) -> usize {
-        let view = self.backend.begin_read().expect("read view");
-
-        // Collect (root_bytes, slot) from BlockHeaders to determine state age.
-        let mut entries: Vec<(Vec<u8>, u64)> = view
-            .prefix_iterator(Table::BlockHeaders, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
-            .map(|(key, value)| {
-                let header = BlockHeader::from_ssz_bytes(&value).expect("valid header");
-                (key.to_vec(), header.slot)
-            })
-            .collect();
-        drop(view);
-
-        if entries.len() <= STATES_TO_KEEP {
-            return 0;
+    /// - if `cutoff <= finalized_slot` (healthy finality): delete signatures for
+    ///   `slot < cutoff` (entirely within finalized history);
+    /// - otherwise (the non-finalized range exceeds the window): prune nothing,
+    ///   since pruning up to `cutoff` would touch non-finalized blocks.
+    ///
+    /// Headers and bodies are always retained. Finalized blocks can never be
+    /// reverted, so their signatures are not needed for fork choice, re-org
+    /// safety, or re-aggregation once outside the window.
+    ///
+    /// Returns the number of signatures pruned.
+    pub fn prune_old_block_signatures(
+        &mut self,
+        finalized_slot: u64,
+        tip_slot: u64,
+    ) -> Result<usize, Error> {
+        let cutoff = tip_slot.saturating_sub(SIGNATURE_PRUNING_RANGE);
+        // Only prune when the whole window is finalized; never touch
+        // non-finalized signatures.
+        if cutoff > finalized_slot {
+            return Ok(0);
         }
 
-        // Sort by slot descending (newest first)
-        entries.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        let view = self.backend.begin_read().expect("read view");
 
-        let protected: HashSet<Vec<u8>> = protected_roots.iter().map(|r| r.to_ssz()).collect();
-
-        // Skip the retention window, collect remaining keys for deletion
-        let keys_to_delete: Vec<Vec<u8>> = entries
-            .into_iter()
-            .skip(STATES_TO_KEEP)
-            .filter(|(key, _)| !protected.contains(key))
-            .map(|(key, _)| key)
+        // Keys are slot||root in big-endian slot order, so iteration ascends by
+        // slot: take entries below the cutoff and stop at the first one past it.
+        let keys_to_delete: Vec<Vec<u8>> = view
+            .prefix_iterator(Table::BlockSignatures, &[])
+            .expect("iterator")
+            .filter_map(|res| res.ok())
+            .map(|(key, _)| key.to_vec())
+            .take_while(|key| decode_slot_root_key(key).0 < cutoff)
             .collect();
+        drop(view);
 
         let count = keys_to_delete.len();
         if count > 0 {
             let mut batch = self.backend.begin_write().expect("write batch");
-            batch
-                .delete_batch(Table::States, keys_to_delete)
-                .expect("delete old states");
-            batch.commit().expect("commit");
-        }
-        count
-    }
-
-    /// Prune old blocks beyond the retention window.
-    ///
-    /// Keeps the most recent `BLOCKS_TO_KEEP` blocks (by slot), plus any
-    /// blocks whose roots appear in `protected_roots` (finalized, justified).
-    /// Deletes from `BlockHeaders`, `BlockBodies`, and `BlockSignatures`.
-    ///
-    /// Returns the number of blocks pruned.
-    pub fn prune_old_blocks(&mut self, protected_roots: &[H256]) -> usize {
-        let view = self.backend.begin_read().expect("read view");
-
-        let mut entries: Vec<(Vec<u8>, u64)> = view
-            .prefix_iterator(Table::BlockHeaders, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
-            .map(|(key, value)| {
-                let header = BlockHeader::from_ssz_bytes(&value).expect("valid header");
-                (key.to_vec(), header.slot)
-            })
-            .collect();
-        drop(view);
-
-        if entries.len() <= BLOCKS_TO_KEEP {
-            return 0;
-        }
-
-        // Sort by slot descending (newest first)
-        entries.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-
-        let protected: HashSet<Vec<u8>> = protected_roots.iter().map(|r| r.to_ssz()).collect();
-
-        let keys_to_delete: Vec<Vec<u8>> = entries
-            .into_iter()
-            .skip(BLOCKS_TO_KEEP)
-            .filter(|(key, _)| !protected.contains(key))
-            .map(|(key, _)| key)
-            .collect();
-
-        let count = keys_to_delete.len();
-        if count > 0 {
-            let mut batch = self.backend.begin_write().expect("write batch");
-            batch
-                .delete_batch(Table::BlockHeaders, keys_to_delete.clone())
-                .expect("delete old block headers");
-            batch
-                .delete_batch(Table::BlockBodies, keys_to_delete.clone())
-                .expect("delete old block bodies");
             batch
                 .delete_batch(Table::BlockSignatures, keys_to_delete)
-                .expect("delete old block signatures");
+                .expect("delete finalized block signatures");
             batch.commit().expect("commit");
         }
-        count
+        Ok(count)
     }
 
     /// Get the block header by root.
-    pub fn get_block_header(&self, root: &H256) -> Option<BlockHeader> {
+    pub fn get_block_header(&self, root: &H256) -> Result<Option<BlockHeader>, Error> {
         let view = self.backend.begin_read().expect("read view");
-        view.get(Table::BlockHeaders, &root.to_ssz())
+        Ok(view
+            .get(Table::BlockHeaders, &root.to_ssz())
             .expect("get")
-            .map(|bytes| BlockHeader::from_ssz_bytes(&bytes).expect("valid header"))
+            .map(|bytes| BlockHeader::from_ssz_bytes(&bytes).expect("valid header")))
     }
 
     // ============ Signed Blocks ============
@@ -1030,10 +1135,15 @@ impl Store {
     ///
     /// When the block is later processed via [`insert_signed_block`](Self::insert_signed_block),
     /// the same keys are overwritten (idempotent) and a `LiveChain` entry is added.
-    pub fn insert_pending_block(&mut self, root: H256, signed_block: SignedBlock) {
+    pub fn insert_pending_block(
+        &mut self,
+        root: H256,
+        signed_block: SignedBlock,
+    ) -> Result<(), Error> {
         let mut batch = self.backend.begin_write().expect("write batch");
         write_signed_block(batch.as_mut(), &root, signed_block);
         batch.commit().expect("commit");
+        Ok(())
     }
 
     /// Insert a signed block, storing the block and signatures separately.
@@ -1043,12 +1153,16 @@ impl Store {
     /// only storing signatures for non-genesis blocks.
     ///
     /// Takes ownership to avoid cloning large signature data.
-    pub fn insert_signed_block(&mut self, root: H256, signed_block: SignedBlock) {
+    pub fn insert_signed_block(
+        &mut self,
+        root: H256,
+        signed_block: SignedBlock,
+    ) -> Result<(), Error> {
         let mut batch = self.backend.begin_write().expect("write batch");
         let block = write_signed_block(batch.as_mut(), &root, signed_block);
 
         let index_entries = vec![(
-            encode_live_chain_key(block.slot, &root),
+            encode_slot_root_key(block.slot, &root),
             block.parent_root.to_ssz(),
         )];
         batch
@@ -1056,27 +1170,32 @@ impl Store {
             .expect("put non-finalized chain index");
 
         batch.commit().expect("commit");
+        Ok(())
     }
 
     /// Get a block (header + body, no signatures) by root.
     ///
     /// Unlike [`get_signed_block`](Self::get_signed_block), this works for the
     /// genesis block, which has no signature entry.
-    pub fn get_block(&self, root: &H256) -> Option<Block> {
+    pub fn get_block(&self, root: &H256) -> Result<Option<Block>, Error> {
         let view = self.backend.begin_read().expect("read view");
         let key = root.to_ssz();
 
-        let header_bytes = view.get(Table::BlockHeaders, &key).expect("get")?;
+        let Some(header_bytes) = view.get(Table::BlockHeaders, &key).expect("get") else {
+            return Ok(None);
+        };
         let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
 
         let body = if header.body_root == *EMPTY_BODY_ROOT {
             BlockBody::default()
         } else {
-            let body_bytes = view.get(Table::BlockBodies, &key).expect("get")?;
+            let Some(body_bytes) = view.get(Table::BlockBodies, &key).expect("get") else {
+                return Ok(None);
+            };
             BlockBody::from_ssz_bytes(&body_bytes).expect("valid body")
         };
 
-        Some(Block::from_header_and_body(header, body))
+        Ok(Some(Block::from_header_and_body(header, body)))
     }
 
     /// Get a signed block by combining header, body, and the merged proof.
@@ -1085,14 +1204,19 @@ impl Store {
     /// or if the signature row is missing for any block other than the
     /// slot-0 anchor.
     ///
-    /// Signatures are absent for genesis-style anchor blocks (no proposer
-    /// ever signed them). To keep BlocksByRoot symmetric with the
-    /// fork-choice view for peers, synthesize an empty proof for the slot-0
-    /// case only; for any other slot the missing-signature state is treated
-    /// as storage corruption and surfaces as `None` rather than as a
-    /// fabricated block.
-    pub fn get_signed_block(&self, root: &H256) -> Option<SignedBlock> {
+    /// Signatures are absent in two cases: genesis-style anchor blocks (no
+    /// proposer ever signed them), and finalized blocks whose signatures were
+    /// pruned by [`prune_old_block_signatures`](Self::prune_old_block_signatures).
+    /// To keep BlocksByRoot symmetric with the fork-choice view for peers,
+    /// synthesize an empty proof for the slot-0 anchor only; for any other slot
+    /// a missing signature surfaces as `None` (a pruned finalized block can no
+    /// longer be served with its proof) rather than as a fabricated block.
+    pub fn get_signed_block(&self, root: &H256) -> Result<Option<SignedBlock>, Error> {
         let view = self.backend.begin_read().expect("read view");
+        Ok(Self::signed_block_from_view(view.as_ref(), root))
+    }
+
+    fn signed_block_from_view(view: &dyn StorageReadView, root: &H256) -> Option<SignedBlock> {
         let key = root.to_ssz();
 
         let header_bytes = view.get(Table::BlockHeaders, &key).expect("get")?;
@@ -1106,13 +1230,14 @@ impl Store {
             BlockBody::from_ssz_bytes(&body_bytes).expect("valid body")
         };
 
-        let proof = match view.get(Table::BlockSignatures, &key).expect("get") {
+        let sig_key = encode_slot_root_key(header.slot, root);
+        let proof = match view.get(Table::BlockSignatures, &sig_key).expect("get") {
             Some(proof_bytes) => {
                 MultiMessageAggregate::from_ssz_bytes(&proof_bytes).expect("valid block proof")
             }
-            // Synthesis only covers the genesis-style anchor (slot 0). Any other
-            // missing-proof case is a storage corruption that should surface
-            // as `None` rather than fabricating a block with an empty proof.
+            // Synthesis only covers the genesis-style anchor (slot 0). For any
+            // other slot a missing proof (pruned finalized block, or genuine
+            // corruption) surfaces as `None` rather than a fabricated block.
             None if header.slot == 0 => MultiMessageAggregate::default(),
             None => return None,
         };
@@ -1125,30 +1250,170 @@ impl Store {
         })
     }
 
+    /// Return canonical signed blocks for the slot range `[start_slot, end_slot]`.
+    ///
+    /// Missing slots or blocks are skipped. This keeps the current request
+    /// behavior while centralizing the slot-index lookup so the storage backend
+    /// can optimize range reads later.
+    pub fn get_signed_blocks_by_slot_range(
+        &self,
+        start_slot: u64,
+        end_slot: u64,
+    ) -> Result<Vec<SignedBlock>, Error> {
+        let view = self.backend.begin_read().expect("read view");
+        let mut blocks = Vec::new();
+        for slot in start_slot..=end_slot {
+            let Some(root_bytes) = view
+                .get(Table::BlockRoots, &encode_block_root_key(slot))
+                .expect("get block root")
+            else {
+                continue;
+            };
+            let root = H256::from_ssz_bytes(&root_bytes).expect("valid block root");
+            if let Some(block) = Self::signed_block_from_view(view.as_ref(), &root) {
+                blocks.push(block);
+            }
+        }
+        Ok(blocks)
+    }
+
     // ============ States ============
 
     /// Returns the state for the given block root.
-    pub fn get_state(&self, root: &H256) -> Option<State> {
-        let view = self.backend.begin_read().expect("read view");
-        view.get(Table::States, &root.to_ssz())
-            .expect("get")
-            .map(|bytes| State::from_ssz_bytes(&bytes).expect("valid state"))
+    ///
+    /// Fast path: a full snapshot in `States`. Otherwise the state is
+    /// reconstructed by walking parent-linked `StateDiffs` back to the nearest
+    /// ancestor snapshot and replaying forward. Returns `None` if the diff chain
+    /// is broken or the target block header is unavailable.
+    pub fn get_state(&self, root: &H256) -> Result<Option<State>, Error> {
+        // Memoized hot states first (states are immutable per root).
+        if let Some(state) = self.state_cache.lock().unwrap().get(root) {
+            return Ok(Some(state.clone()));
+        }
+        // Anchor snapshot in `States`, otherwise reconstruct from the diff chain.
+        let snapshot = {
+            let view = self.backend.begin_read().expect("read view");
+            view.get(Table::States, &root.to_ssz())
+                .expect("get")
+                .map(|bytes| State::from_ssz_bytes(&bytes).expect("valid state"))
+        };
+        let state = if let Some(s) = snapshot {
+            s
+        } else {
+            let Some(s) = self.reconstruct_state(root)? else {
+                return Ok(None);
+            };
+            s
+        };
+        self.state_cache.lock().unwrap().put(*root, state.clone());
+        Ok(Some(state))
     }
 
-    /// Returns whether a state exists for the given block root.
-    pub fn has_state(&self, root: &H256) -> bool {
+    /// Reconstruct a state from diffs and the nearest ancestor snapshot.
+    ///
+    /// Walks `base_root` pointers back until a snapshot is found, fetches the
+    /// target's block header, and delegates the assembly to
+    /// [`state_diff::reconstruct`](crate::state_diff::reconstruct).
+    ///
+    /// Returns `Ok(None)` when the root is unknown or the diff chain is broken.
+    fn reconstruct_state(&self, root: &H256) -> Result<Option<State>, Error> {
+        // Walk back collecting diffs until we reach a snapshot.
         let view = self.backend.begin_read().expect("read view");
-        view.get(Table::States, &root.to_ssz())
-            .expect("get")
-            .is_some()
+        let mut diffs: Vec<StateDiff> = Vec::new();
+        let mut cursor = *root;
+        let snapshot = loop {
+            if let Some(bytes) = view.get(Table::States, &cursor.to_ssz()).expect("get") {
+                break State::from_ssz_bytes(&bytes).expect("valid state");
+            }
+            let Some(diff_bytes) = view.get(Table::StateDiffs, &cursor.to_ssz()).expect("get")
+            else {
+                return Ok(None);
+            };
+            let diff = StateDiff::from_ssz_bytes(&diff_bytes).expect("valid state diff");
+            cursor = diff.base_root;
+            diffs.push(diff);
+        };
+        drop(view);
+
+        // `diffs` runs target -> snapshot child; reverse to snapshot child -> target.
+        diffs.reverse();
+
+        // The latest block header lives in BlockHeaders; the stored state caches
+        // the real state_root there, so it equals the header byte-for-byte.
+        let Some(latest_block_header) = self.get_block_header(root)? else {
+            return Ok(None);
+        };
+
+        Ok(Some(crate::state_diff::reconstruct(
+            snapshot,
+            &diffs,
+            latest_block_header,
+        )))
     }
 
-    /// Stores a state indexed by block root.
-    pub fn insert_state(&mut self, root: H256, state: State) {
+    /// Returns whether a state is available for the given block root.
+    ///
+    /// True if a snapshot exists or the state can be reconstructed from a diff.
+    pub fn has_state(&self, root: &H256) -> Result<bool, Error> {
+        let view = self.backend.begin_read().expect("read view");
+        let key = root.to_ssz();
+        let states = view.get(Table::States, &key).expect("get");
+        let diffs = view.get(Table::StateDiffs, &key).expect("get");
+        Ok(states.is_some() || diffs.is_some())
+    }
+
+    /// Persist a post-block state as a parent-linked diff, snapshotting at anchors.
+    ///
+    /// Every non-genesis state gets a `StateDiffs` entry (never pruned, so the
+    /// full state history is preserved). A full snapshot is written to `States`
+    /// only when the block crosses a [`SNAPSHOT_ANCHOR_INTERVAL`] boundary; these
+    /// anchors are never pruned and bound the reconstruction walk. The state is
+    /// also inserted into the in-memory cache so the immediate next read (e.g. as
+    /// a child block's parent state) is hot without reconstruction.
+    ///
+    /// The diff is built against the parent state, identified by the post-state's
+    /// own `latest_block_header.parent_root` (the state transition sets it to the
+    /// block's parent) and fetched via [`get_state`](Self::get_state). The parent
+    /// was persisted when its own block was imported, so this read is normally a
+    /// cache hit; a cold cache falls back to a snapshot read or a diff-chain
+    /// reconstruction.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no state exists for the parent root: a child state can only be
+    /// inserted after its parent's state has been persisted.
+    pub fn insert_state(&mut self, root: H256, state: State) -> Result<(), Error> {
+        // The post-state's latest_block_header is the block's own header, so its
+        // parent_root identifies the parent (base) state to diff against.
+        let parent_root = state.latest_block_header.parent_root;
+        let parent_state = self
+            .get_state(&parent_root)
+            .expect("parent state must exist to diff against")
+            .unwrap();
+        let is_anchor =
+            state.slot / SNAPSHOT_ANCHOR_INTERVAL > parent_state.slot / SNAPSHOT_ANCHOR_INTERVAL;
+
+        // Snapshot only at anchors; serialize before `state` is consumed.
+        let snapshot_bytes = is_anchor.then(|| state.to_ssz());
+        // Memoize the post-state for fast reads, then move it into the diff so
+        // its multi-MB justification fields are not cloned again.
+        self.state_cache.lock().unwrap().put(root, state.clone());
+        let diff_bytes = StateDiff::from_states(&parent_state, state)
+            .expect("state transition produced a non-append historical_block_hashes")
+            .to_ssz();
+
+        let key = root.to_ssz();
         let mut batch = self.backend.begin_write().expect("write batch");
-        let entries = vec![(root.to_ssz(), state.to_ssz())];
-        batch.put_batch(Table::States, entries).expect("put state");
+        batch
+            .put_batch(Table::StateDiffs, vec![(key.clone(), diff_bytes)])
+            .expect("put state diff");
+        if let Some(snapshot_bytes) = snapshot_bytes {
+            batch
+                .put_batch(Table::States, vec![(key, snapshot_bytes)])
+                .expect("put state snapshot");
+        }
         batch.commit().expect("commit");
+        Ok(())
     }
 
     // ============ Attestation Extraction ============
@@ -1169,6 +1434,19 @@ impl Store {
             .extract_latest_attestations()
     }
 
+    /// Extract per-validator latest attestations from the raw gossip signature
+    /// pool (the spec's `attestation_signatures`).
+    ///
+    /// Unlike the aggregated pools, this pool holds one entry per validator per
+    /// vote, so it reflects raw per-validator signatures before aggregation.
+    /// Each validator maps to its highest-slot vote (first-seen-wins on ties).
+    pub fn extract_latest_signature_attestations(&self) -> HashMap<u64, AttestationData> {
+        self.gossip_signatures
+            .lock()
+            .unwrap()
+            .extract_latest_attestations()
+    }
+
     // ============ Known Aggregated Payloads ============
     //
     // "Known" aggregated payloads are active in fork choice weight calculations.
@@ -1177,7 +1455,7 @@ impl Store {
     /// Returns a snapshot of known payloads as (AttestationData, Vec<proof>) pairs.
     pub fn known_aggregated_payloads(
         &self,
-    ) -> HashMap<H256, (AttestationData, Vec<TypeOneMultiSignature>)> {
+    ) -> HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)> {
         let buf = self.known_payloads.lock().unwrap();
         buf.data
             .iter()
@@ -1212,7 +1490,7 @@ impl Store {
     pub fn existing_proofs_for_data(
         &self,
         data_root: &H256,
-    ) -> (Vec<TypeOneMultiSignature>, Vec<TypeOneMultiSignature>) {
+    ) -> (Vec<SingleMessageAggregate>, Vec<SingleMessageAggregate>) {
         let new = self.new_payloads.lock().unwrap().proofs_for_root(data_root);
         let known = self
             .known_payloads
@@ -1234,7 +1512,7 @@ impl Store {
     pub fn insert_known_aggregated_payload(
         &mut self,
         hashed: HashedAttestationData,
-        proof: TypeOneMultiSignature,
+        proof: SingleMessageAggregate,
     ) {
         self.known_payloads.lock().unwrap().push(hashed, proof);
     }
@@ -1242,7 +1520,7 @@ impl Store {
     /// Batch-insert proofs into the known buffer.
     pub fn insert_known_aggregated_payloads_batch(
         &mut self,
-        entries: Vec<(HashedAttestationData, TypeOneMultiSignature)>,
+        entries: Vec<(HashedAttestationData, SingleMessageAggregate)>,
     ) {
         self.known_payloads.lock().unwrap().push_batch(entries);
     }
@@ -1256,7 +1534,7 @@ impl Store {
     pub fn insert_new_aggregated_payload(
         &mut self,
         hashed: HashedAttestationData,
-        proof: TypeOneMultiSignature,
+        proof: SingleMessageAggregate,
     ) {
         self.new_payloads.lock().unwrap().push(hashed, proof);
     }
@@ -1264,7 +1542,7 @@ impl Store {
     /// Batch-insert proofs into the new buffer.
     pub fn insert_new_aggregated_payloads_batch(
         &mut self,
-        entries: Vec<(HashedAttestationData, TypeOneMultiSignature)>,
+        entries: Vec<(HashedAttestationData, SingleMessageAggregate)>,
     ) {
         self.new_payloads.lock().unwrap().push_batch(entries);
     }
@@ -1317,6 +1595,15 @@ impl Store {
         gossip.total_signatures()
     }
 
+    /// Largest per-group signature count among gossip groups voting for `slot`.
+    ///
+    /// One lock, no signature clones — cheap enough to call per gossip insert.
+    /// Drives the early-aggregation threshold check.
+    pub fn max_gossip_group_count_for_slot(&self, slot: u64) -> usize {
+        let gossip = self.gossip_signatures.lock().unwrap();
+        gossip.max_group_count_for_slot(slot)
+    }
+
     /// Estimated live data size in bytes for a table, as reported by the backend.
     pub fn estimate_table_bytes(&self, table: Table) -> u64 {
         self.backend.estimate_table_bytes(table)
@@ -1356,22 +1643,25 @@ impl Store {
 
     /// Returns the slot of the current head block.
     pub fn head_slot(&self) -> u64 {
-        self.get_block_header(&self.head())
+        self.get_block_header(&self.head().expect("head block exists"))
             .expect("head block exists")
+            .unwrap()
             .slot
     }
 
     /// Returns the slot of the current safe target block.
     pub fn safe_target_slot(&self) -> u64 {
-        self.get_block_header(&self.safe_target())
+        self.get_block_header(&self.safe_target().expect("safe target exists"))
             .expect("safe target exists")
+            .unwrap()
             .slot
     }
 
     /// Returns a clone of the head state.
     pub fn head_state(&self) -> State {
-        self.get_state(&self.head())
+        self.get_state(&self.head().expect("head block exists"))
             .expect("head state is always available")
+            .unwrap()
     }
 }
 
@@ -1405,9 +1695,10 @@ fn write_signed_block(
             .expect("put block body");
     }
 
-    // Store the merged Type-2 proof blob. Table name kept for the column-family
-    // migration cost; renaming to `BlockProof` is a follow-up.
-    let proof_entries = vec![(root_bytes, proof.to_ssz())];
+    // Store the merged multi-message aggregate proof blob, keyed by slot||root so signature
+    // pruning can scan in slot order and stop early. Table name kept for the
+    // column-family migration cost; renaming to `BlockProof` is a follow-up.
+    let proof_entries = vec![(encode_slot_root_key(header.slot, root), proof.to_ssz())];
     batch
         .put_batch(Table::BlockSignatures, proof_entries)
         .expect("put block proof");
@@ -1420,15 +1711,11 @@ mod tests {
     use super::*;
     use crate::backend::InMemoryBackend;
 
-    /// Insert a block header (and dummy body + signature) for a given root and slot.
-    fn insert_header(backend: &dyn StorageBackend, root: H256, slot: u64) {
-        let header = BlockHeader {
-            slot,
-            proposer_index: 0,
-            parent_root: H256::ZERO,
-            state_root: H256::ZERO,
-            body_root: H256::ZERO,
-        };
+    /// Insert a block header (and dummy body + signature) for a given root, slot,
+    /// and parent. The stored header equals `header_at(slot, parent_root)`, so a
+    /// state built from the same `(slot, parent_root)` reconstructs byte-identically.
+    fn insert_header(backend: &dyn StorageBackend, root: H256, slot: u64, parent_root: H256) {
+        let header = header_at(slot, parent_root);
         let mut batch = backend.begin_write().expect("write batch");
         let key = root.to_ssz();
         batch
@@ -1438,18 +1725,26 @@ mod tests {
             .put_batch(Table::BlockBodies, vec![(key.clone(), vec![0u8; 4])])
             .expect("put body");
         batch
-            .put_batch(Table::BlockSignatures, vec![(key, vec![0u8; 4])])
+            .put_batch(
+                Table::BlockSignatures,
+                vec![(encode_slot_root_key(slot, &root), vec![0u8; 4])],
+            )
             .expect("put sigs");
+        batch
+            .put_batch(
+                Table::BlockRoots,
+                vec![(encode_block_root_key(slot), root.to_ssz())],
+            )
+            .expect("put block root");
         batch.commit().expect("commit");
     }
 
-    /// Insert a dummy state for a given root.
-    fn insert_state(backend: &dyn StorageBackend, root: H256) {
+    /// Insert a real full-state snapshot for a given root (seeds a diff-chain base).
+    fn insert_snapshot(backend: &dyn StorageBackend, root: H256, state: &State) {
         let mut batch = backend.begin_write().expect("write batch");
-        let key = root.to_ssz();
         batch
-            .put_batch(Table::States, vec![(key, vec![0u8; 4])])
-            .expect("put state");
+            .put_batch(Table::States, vec![(root.to_ssz(), state.to_ssz())])
+            .expect("put snapshot");
         batch.commit().expect("commit");
     }
 
@@ -1468,11 +1763,40 @@ mod tests {
         view.get(table, &root.to_ssz()).expect("get").is_some()
     }
 
+    /// Check whether a block signature exists for a (slot, root) pair.
+    fn has_signature(backend: &dyn StorageBackend, slot: u64, root: &H256) -> bool {
+        let view = backend.begin_read().expect("read view");
+        view.get(Table::BlockSignatures, &encode_slot_root_key(slot, root))
+            .expect("get")
+            .is_some()
+    }
+
+    /// Return the canonical block root at `slot` for storage-index assertions.
+    fn block_root_by_slot(backend: &dyn StorageBackend, slot: u64) -> Option<H256> {
+        let view = backend.begin_read().expect("read view");
+        view.get(Table::BlockRoots, &encode_block_root_key(slot))
+            .expect("get block root")
+            .map(|bytes| H256::from_ssz_bytes(&bytes).expect("valid block root"))
+    }
+
     /// Generate a deterministic H256 root from an index.
     fn root(index: u64) -> H256 {
         let mut bytes = [0u8; 32];
         bytes[..8].copy_from_slice(&index.to_be_bytes());
         H256::from(bytes)
+    }
+
+    fn signed_block(slot: u64, parent_root: H256) -> SignedBlock {
+        SignedBlock {
+            message: Block {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: H256::ZERO,
+                body: BlockBody::default(),
+            },
+            proof: MultiMessageAggregate::default(),
+        }
     }
 
     impl Store {
@@ -1486,6 +1810,7 @@ mod tests {
                 gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                     GOSSIP_SIGNATURE_CAP,
                 ))),
+                state_cache: new_state_cache(),
             }
         }
 
@@ -1499,322 +1824,329 @@ mod tests {
                 gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                     GOSSIP_SIGNATURE_CAP,
                 ))),
+                state_cache: new_state_cache(),
             }
         }
     }
 
-    // ============ Block Pruning Tests ============
+    // ============ Block Signature Pruning Tests ============
+
+    #[test]
+    fn block_root_index_tracks_canonical_chain_across_reorgs() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(backend, State::from_genesis(0, vec![]));
+        let anchor_root = store.head().expect("head root");
+
+        let block_1 = signed_block(1, anchor_root);
+        let root_1 = block_1.message.hash_tree_root();
+        store
+            .insert_signed_block(root_1, block_1)
+            .expect("insert block 1");
+
+        let block_3 = signed_block(3, root_1);
+        let root_3 = block_3.message.hash_tree_root();
+        store
+            .insert_signed_block(root_3, block_3)
+            .expect("insert block 3");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(root_3))
+            .expect("update head to block 3");
+
+        assert_eq!(
+            block_root_by_slot(store.backend.as_ref(), 0),
+            Some(anchor_root)
+        );
+        assert_eq!(block_root_by_slot(store.backend.as_ref(), 1), Some(root_1));
+        assert_eq!(block_root_by_slot(store.backend.as_ref(), 2), None);
+        assert_eq!(block_root_by_slot(store.backend.as_ref(), 3), Some(root_3));
+
+        let side_block_2 = signed_block(2, anchor_root);
+        let side_root_2 = side_block_2.message.hash_tree_root();
+        store
+            .insert_signed_block(side_root_2, side_block_2)
+            .expect("insert side block 2");
+
+        let side_block_4 = signed_block(4, side_root_2);
+        let side_root_4 = side_block_4.message.hash_tree_root();
+        store
+            .insert_signed_block(side_root_4, side_block_4)
+            .expect("insert side block 4");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(side_root_4))
+            .expect("update head to side block 4");
+
+        assert_eq!(
+            block_root_by_slot(store.backend.as_ref(), 0),
+            Some(anchor_root)
+        );
+        assert_eq!(block_root_by_slot(store.backend.as_ref(), 1), None);
+        assert_eq!(
+            block_root_by_slot(store.backend.as_ref(), 2),
+            Some(side_root_2)
+        );
+        assert_eq!(block_root_by_slot(store.backend.as_ref(), 3), None);
+        assert_eq!(
+            block_root_by_slot(store.backend.as_ref(), 4),
+            Some(side_root_4)
+        );
+    }
+
+    #[test]
+    fn from_db_state_preserves_block_root_index() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store =
+            Store::from_anchor_state(backend.clone(), State::from_genesis(12345, vec![]));
+
+        let block = signed_block(1, store.head().expect("head root"));
+        let block_root = block.message.hash_tree_root();
+        store
+            .insert_signed_block(block_root, block)
+            .expect("insert block");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(block_root))
+            .expect("update head");
+
+        let restored = Store::from_db_state(backend, 12345)
+            .expect("restore store")
+            .expect("store exists");
+        let blocks = restored
+            .get_signed_blocks_by_slot_range(1, 1)
+            .expect("get blocks by slot range");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].message.hash_tree_root(), block_root);
+    }
 
     #[test]
     fn prune_old_blocks_within_retention() {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::test_store_with_backend(backend.clone());
 
-        // Insert exactly BLOCKS_TO_KEEP blocks
-        for i in 0..BLOCKS_TO_KEEP as u64 {
-            insert_header(backend.as_ref(), root(i), i);
+        // Blocks at slots 0..12, each with header + body + signature.
+        for i in 0..13u64 {
+            insert_header(backend.as_ref(), root(i), i, H256::ZERO);
         }
-        assert_eq!(
-            count_entries(backend.as_ref(), Table::BlockHeaders),
-            BLOCKS_TO_KEEP
-        );
 
-        let pruned = store.prune_old_blocks(&[]);
-        assert_eq!(pruned, 0);
-        assert_eq!(
-            count_entries(backend.as_ref(), Table::BlockHeaders),
-            BLOCKS_TO_KEEP
-        );
-    }
+        // Healthy finality: non-finalized gap (5) < SIGNATURE_PRUNING_RANGE.
+        // tip = range + 10, finalized = range + 5, so cutoff = tip - range = 10.
+        let tip_slot = SIGNATURE_PRUNING_RANGE + 10;
+        let finalized_slot = SIGNATURE_PRUNING_RANGE + 5;
+        let pruned = store
+            .prune_old_block_signatures(finalized_slot, tip_slot)
+            .expect("prune");
 
-    #[test]
-    fn prune_old_blocks_exceeding_retention() {
-        let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store::test_store_with_backend(backend.clone());
-
-        let total = BLOCKS_TO_KEEP + 10;
-        for i in 0..total as u64 {
-            insert_header(backend.as_ref(), root(i), i);
-        }
-        assert_eq!(count_entries(backend.as_ref(), Table::BlockHeaders), total);
-
-        let pruned = store.prune_old_blocks(&[]);
+        // cutoff = 10: slots 0..9 pruned, slots 10..12 kept (within the window).
         assert_eq!(pruned, 10);
-        assert_eq!(
-            count_entries(backend.as_ref(), Table::BlockHeaders),
-            BLOCKS_TO_KEEP
-        );
-        assert_eq!(
-            count_entries(backend.as_ref(), Table::BlockBodies),
-            BLOCKS_TO_KEEP
-        );
-        assert_eq!(
-            count_entries(backend.as_ref(), Table::BlockSignatures),
-            BLOCKS_TO_KEEP
-        );
+        assert_eq!(count_entries(backend.as_ref(), Table::BlockSignatures), 3);
 
-        // Oldest blocks (slots 0..10) should be gone
+        // Oldest signatures are gone, but headers, bodies, and roots stay queryable.
         for i in 0..10u64 {
-            assert!(!has_key(backend.as_ref(), Table::BlockHeaders, &root(i)));
+            assert!(!has_signature(backend.as_ref(), i, &root(i)));
         }
-        // Newest blocks should still exist
-        for i in 10..total as u64 {
-            assert!(has_key(backend.as_ref(), Table::BlockHeaders, &root(i)));
+        for i in 10..13u64 {
+            assert!(has_signature(backend.as_ref(), i, &root(i)));
         }
+
+        // Headers and bodies are always retained for the whole history.
+        assert_eq!(count_entries(backend.as_ref(), Table::BlockHeaders), 13);
+        assert_eq!(count_entries(backend.as_ref(), Table::BlockBodies), 13);
+        assert_eq!(count_entries(backend.as_ref(), Table::BlockRoots), 13);
     }
 
     #[test]
-    fn prune_old_blocks_preserves_protected() {
+    fn prune_signatures_noop_when_non_finalized_range_exceeds_window() {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::test_store_with_backend(backend.clone());
 
-        let total = BLOCKS_TO_KEEP + 10;
-        for i in 0..total as u64 {
-            insert_header(backend.as_ref(), root(i), i);
+        for i in 0..10u64 {
+            insert_header(backend.as_ref(), root(i), i, H256::ZERO);
         }
 
-        // Protect the two oldest blocks (slots 0 and 1)
-        let finalized_root = root(0);
-        let justified_root = root(1);
-        let pruned = store.prune_old_blocks(&[finalized_root, justified_root]);
-
-        // 10 would be pruned, but 2 are protected
-        assert_eq!(pruned, 8);
-        assert!(has_key(
-            backend.as_ref(),
-            Table::BlockHeaders,
-            &finalized_root
-        ));
-        assert!(has_key(
-            backend.as_ref(),
-            Table::BlockHeaders,
-            &justified_root
-        ));
-        assert!(has_key(
-            backend.as_ref(),
-            Table::BlockBodies,
-            &finalized_root
-        ));
-        assert!(has_key(
-            backend.as_ref(),
-            Table::BlockSignatures,
-            &finalized_root
-        ));
-    }
-
-    // ============ State Pruning Tests ============
-
-    #[test]
-    fn prune_old_states_within_retention() {
-        let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store::test_store_with_backend(backend.clone());
-
-        // Insert STATES_TO_KEEP headers + states
-        for i in 0..STATES_TO_KEEP as u64 {
-            insert_header(backend.as_ref(), root(i), i);
-            insert_state(backend.as_ref(), root(i));
-        }
-        assert_eq!(
-            count_entries(backend.as_ref(), Table::States),
-            STATES_TO_KEEP
-        );
-
-        let pruned = store.prune_old_states(&[]);
+        // Deep non-finality: gap (tip - finalized) > SIGNATURE_PRUNING_RANGE, so
+        // cutoff = tip - range > finalized → prune nothing.
+        let tip_slot = SIGNATURE_PRUNING_RANGE + 100;
+        let finalized_slot = 5;
+        let pruned = store
+            .prune_old_block_signatures(finalized_slot, tip_slot)
+            .expect("prune");
         assert_eq!(pruned, 0);
+        assert_eq!(count_entries(backend.as_ref(), Table::BlockSignatures), 10);
     }
 
     #[test]
-    fn prune_old_states_exceeding_retention() {
+    fn prune_signatures_noop_when_tip_within_window() {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::test_store_with_backend(backend.clone());
 
-        let total = STATES_TO_KEEP + 5;
-        for i in 0..total as u64 {
-            insert_header(backend.as_ref(), root(i), i);
-            insert_state(backend.as_ref(), root(i));
+        for i in 0..10u64 {
+            insert_header(backend.as_ref(), root(i), i, H256::ZERO);
         }
-        assert_eq!(count_entries(backend.as_ref(), Table::States), total);
 
-        let pruned = store.prune_old_states(&[]);
-        assert_eq!(pruned, 5);
-        assert_eq!(
-            count_entries(backend.as_ref(), Table::States),
-            STATES_TO_KEEP
-        );
+        // Early chain: tip < SIGNATURE_PRUNING_RANGE → cutoff saturates to 0,
+        // so nothing is old enough to prune even though slots are finalized.
+        let pruned = store.prune_old_block_signatures(9, 9).expect("prune");
+        assert_eq!(pruned, 0);
+        assert_eq!(count_entries(backend.as_ref(), Table::BlockSignatures), 10);
+    }
 
-        // Oldest states should be gone
-        for i in 0..5u64 {
-            assert!(!has_key(backend.as_ref(), Table::States, &root(i)));
+    // ============ State Diff Reconstruction Tests ============
+
+    use ethlambda_types::state::Validator;
+
+    /// The header `insert_header` writes for a given slot and parent.
+    fn header_at(slot: u64, parent_root: H256) -> BlockHeader {
+        BlockHeader {
+            slot,
+            proposer_index: 0,
+            parent_root,
+            state_root: H256::ZERO,
+            body_root: H256::ZERO,
         }
-        // Newest states should remain
-        for i in 5..total as u64 {
-            assert!(has_key(backend.as_ref(), Table::States, &root(i)));
-        }
+    }
+
+    /// A real `State` at `slot` whose `latest_block_header` matches what
+    /// `insert_header` stores for `(slot, parent_root)`; `parent_root` is also the
+    /// base the diff is built against (`insert_state` reads it back from the
+    /// post-state's `latest_block_header`).
+    fn sample_state(slot: u64, parent_root: H256, hbh: Vec<H256>) -> State {
+        let validators = vec![Validator {
+            attestation_pubkey: [7u8; 52],
+            proposal_pubkey: [9u8; 52],
+            index: 0,
+        }];
+        let mut state = State::from_genesis(1_000, validators);
+        state.slot = slot;
+        state.latest_block_header = header_at(slot, parent_root);
+        state.historical_block_hashes = hbh.try_into().unwrap();
+        state
     }
 
     #[test]
-    fn prune_old_states_preserves_protected() {
+    fn get_state_reconstructs_from_diff() {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::test_store_with_backend(backend.clone());
 
-        let total = STATES_TO_KEEP + 5;
-        for i in 0..total as u64 {
-            insert_header(backend.as_ref(), root(i), i);
-            insert_state(backend.as_ref(), root(i));
-        }
+        // Genesis snapshot at slot 0; its block root is its header's hash.
+        let s0 = sample_state(0, H256::ZERO, vec![]);
+        let r0 = s0.latest_block_header.hash_tree_root();
+        insert_header(backend.as_ref(), r0, 0, H256::ZERO);
+        insert_snapshot(backend.as_ref(), r0, &s0);
 
-        let finalized_root = root(0);
-        let justified_root = root(2);
-        let pruned = store.prune_old_states(&[finalized_root, justified_root]);
+        // Child at slot 1 (parent r0): appends r0 (slot 0's block root), sets a checkpoint.
+        let mut s1 = sample_state(1, r0, vec![r0]);
+        s1.latest_justified = Checkpoint {
+            root: root(7),
+            slot: 0,
+        };
+        let r1 = s1.latest_block_header.hash_tree_root();
+        insert_header(backend.as_ref(), r1, 1, r0);
+        store.insert_state(r1, s1.clone()).expect("insert state");
 
-        // 5 would be pruned, but 2 are protected
-        assert_eq!(pruned, 3);
-        assert!(has_key(backend.as_ref(), Table::States, &finalized_root));
-        assert!(has_key(backend.as_ref(), Table::States, &justified_root));
-    }
+        // Not an anchor, so no snapshot was written; only the diff.
+        assert!(!has_key(backend.as_ref(), Table::States, &r1));
 
-    // ============ Periodic Pruning Tests ============
-
-    /// Set up finalized and justified checkpoints in metadata.
-    fn set_checkpoints(backend: &dyn StorageBackend, finalized: Checkpoint, justified: Checkpoint) {
-        let mut batch = backend.begin_write().expect("write batch");
-        batch
-            .put_batch(
-                Table::Metadata,
-                vec![
-                    (KEY_LATEST_FINALIZED.to_vec(), finalized.to_ssz()),
-                    (KEY_LATEST_JUSTIFIED.to_vec(), justified.to_ssz()),
-                ],
-            )
-            .expect("put checkpoints");
-        batch.commit().expect("commit");
-    }
-
-    #[test]
-    fn fallback_pruning_removes_old_states_and_blocks() {
-        let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store::test_store_with_backend(backend.clone());
-
-        // Use roots that are within the retention window as finalized/justified
-        let finalized_root = root(0);
-        let justified_root = root(1);
-        set_checkpoints(
-            backend.as_ref(),
-            Checkpoint {
-                slot: 0,
-                root: finalized_root,
-            },
-            Checkpoint {
-                slot: 1,
-                root: justified_root,
-            },
-        );
-
-        // Insert more than STATES_TO_KEEP headers + states, but fewer than BLOCKS_TO_KEEP
-        let total_states = STATES_TO_KEEP + 5;
-        for i in 0..total_states as u64 {
-            insert_header(backend.as_ref(), root(i), i);
-            insert_state(backend.as_ref(), root(i));
-        }
-
-        assert_eq!(count_entries(backend.as_ref(), Table::States), total_states);
+        // Hot path: the just-imported state is memoized in the cache.
         assert_eq!(
-            count_entries(backend.as_ref(), Table::BlockHeaders),
-            total_states
+            store
+                .get_state(&r1)
+                .expect("get state")
+                .expect("state exists")
+                .to_ssz(),
+            s1.to_ssz()
         );
 
-        // Use the last inserted root as head. Calling update_checkpoints with
-        // head_only triggers the fallback path (finalization doesn't advance).
-        let head_root = root(total_states as u64 - 1);
-        store.update_checkpoints(ForkCheckpoints::head_only(head_root));
-
-        // update_checkpoints no longer prunes states/blocks inline — the caller
-        // must invoke prune_old_data() separately (after a block cascade completes).
-        assert_eq!(count_entries(backend.as_ref(), Table::States), total_states);
-
-        store.prune_old_data();
-
-        // 3005 headers total. Top 3000 by slot are kept in the retention window,
-        // leaving 5 candidates. 2 are protected (finalized + justified),
-        // so 3 are pruned → 3005 - 3 = 3002 states remaining.
-        assert_eq!(
-            count_entries(backend.as_ref(), Table::States),
-            STATES_TO_KEEP + 2
-        );
-        // Finalized and justified states must survive
-        assert!(has_key(backend.as_ref(), Table::States, &finalized_root));
-        assert!(has_key(backend.as_ref(), Table::States, &justified_root));
-
-        // Blocks: total_states < BLOCKS_TO_KEEP, so no blocks should be pruned
-        assert_eq!(
-            count_entries(backend.as_ref(), Table::BlockHeaders),
-            total_states
-        );
+        // A cold store (empty cache, shared backend) reconstructs from the diff,
+        // byte-identically.
+        let cold = Store::test_store_with_backend(backend.clone());
+        let reconstructed = cold
+            .get_state(&r1)
+            .expect("reconstructs from diff")
+            .expect("state exists");
+        assert_eq!(reconstructed.to_ssz(), s1.to_ssz());
     }
 
     #[test]
-    fn fallback_pruning_no_op_within_retention() {
+    fn get_state_reconstructs_across_multiple_diffs() {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::test_store_with_backend(backend.clone());
 
-        set_checkpoints(
-            backend.as_ref(),
-            Checkpoint {
-                slot: 0,
-                root: root(0),
-            },
-            Checkpoint {
-                slot: 0,
-                root: root(0),
-            },
-        );
+        // Snapshot s0, then two chained diffs s1 -> s2; each block root is the
+        // hash of its header, as in production.
+        let s0 = sample_state(0, H256::ZERO, vec![]);
+        let r0 = s0.latest_block_header.hash_tree_root();
+        insert_header(backend.as_ref(), r0, 0, H256::ZERO);
+        insert_snapshot(backend.as_ref(), r0, &s0);
 
-        // Insert exactly STATES_TO_KEEP entries (no excess)
-        for i in 0..STATES_TO_KEEP as u64 {
-            insert_header(backend.as_ref(), root(i), i);
-            insert_state(backend.as_ref(), root(i));
-        }
+        let s1 = sample_state(1, r0, vec![r0]);
+        let r1 = s1.latest_block_header.hash_tree_root();
+        insert_header(backend.as_ref(), r1, 1, r0);
+        store.insert_state(r1, s1.clone()).expect("insert state");
 
-        // Use the last inserted root as head
-        let head_root = root(STATES_TO_KEEP as u64 - 1);
-        store.update_checkpoints(ForkCheckpoints::head_only(head_root));
-        store.prune_old_data();
+        let s2 = sample_state(2, r1, vec![r0, r1]);
+        let r2 = s2.latest_block_header.hash_tree_root();
+        insert_header(backend.as_ref(), r2, 2, r1);
+        store.insert_state(r2, s2.clone()).expect("insert state");
 
-        // Nothing should be pruned (within retention window)
-        assert_eq!(
-            count_entries(backend.as_ref(), Table::States),
-            STATES_TO_KEEP
-        );
-        assert_eq!(
-            count_entries(backend.as_ref(), Table::BlockHeaders),
-            STATES_TO_KEEP
-        );
+        // Neither child is an anchor, so a cold store reconstructs s2 by walking
+        // the diff chain back to the s0 snapshot.
+        assert!(!has_key(backend.as_ref(), Table::States, &r1));
+        assert!(!has_key(backend.as_ref(), Table::States, &r2));
+        let cold = Store::test_store_with_backend(backend.clone());
+        let reconstructed = cold
+            .get_state(&r2)
+            .expect("reconstructs across diffs")
+            .expect("state exists");
+        assert_eq!(reconstructed.to_ssz(), s2.to_ssz());
+    }
+
+    #[test]
+    fn insert_state_snapshots_only_on_boundary_crossing() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::test_store_with_backend(backend.clone());
+
+        let s0 = sample_state(SNAPSHOT_ANCHOR_INTERVAL - 1, H256::ZERO, vec![]);
+        let r0 = s0.latest_block_header.hash_tree_root();
+        insert_header(backend.as_ref(), r0, s0.slot, H256::ZERO);
+        insert_snapshot(backend.as_ref(), r0, &s0);
+
+        // Crossing the interval boundary records an anchor.
+        let s1 = sample_state(SNAPSHOT_ANCHOR_INTERVAL, r0, vec![r0]);
+        let r1 = s1.latest_block_header.hash_tree_root();
+        insert_header(backend.as_ref(), r1, s1.slot, r0);
+        store.insert_state(r1, s1.clone()).expect("insert state");
+        assert!(has_key(backend.as_ref(), Table::States, &r1));
+
+        // A non-crossing child does not.
+        let s2 = sample_state(SNAPSHOT_ANCHOR_INTERVAL + 1, r1, vec![r0, r1]);
+        let r2 = s2.latest_block_header.hash_tree_root();
+        insert_header(backend.as_ref(), r2, s2.slot, r1);
+        store.insert_state(r2, s2.clone()).expect("insert state");
+        assert!(!has_key(backend.as_ref(), Table::States, &r2));
     }
 
     // ============ PayloadBuffer Tests ============
 
-    fn make_proof() -> TypeOneMultiSignature {
+    fn make_proof() -> SingleMessageAggregate {
         use ethlambda_types::attestation::AggregationBits;
-        TypeOneMultiSignature::empty(AggregationBits::new())
+        SingleMessageAggregate::empty(AggregationBits::new())
     }
 
     /// Create a proof with a specific validator bit set (distinct participants).
-    fn make_proof_for_validator(vid: usize) -> TypeOneMultiSignature {
+    fn make_proof_for_validator(vid: usize) -> SingleMessageAggregate {
         use ethlambda_types::attestation::AggregationBits;
         let mut bits = AggregationBits::with_length(vid + 1).unwrap();
         bits.set(vid, true).unwrap();
-        TypeOneMultiSignature::empty(bits)
+        SingleMessageAggregate::empty(bits)
     }
 
     /// Create a proof with bits set for every validator in `vids`.
-    fn make_proof_for_validators(vids: &[u64]) -> TypeOneMultiSignature {
+    fn make_proof_for_validators(vids: &[u64]) -> SingleMessageAggregate {
         use ethlambda_types::attestation::AggregationBits;
         let max = vids.iter().copied().max().unwrap_or(0) as usize;
         let mut bits = AggregationBits::with_length(max + 1).unwrap();
         for &v in vids {
             bits.set(v as usize, true).unwrap();
         }
-        TypeOneMultiSignature::empty(bits)
+        SingleMessageAggregate::empty(bits)
     }
 
     fn make_att_data(slot: u64) -> AttestationData {
@@ -2280,51 +2612,58 @@ mod tests {
     }
 
     /// When two aggregations share `slot` but disagree on the target
-    /// (same-slot equivocation), the *first inserted* aggregation must win for
-    /// the validators that participate in both. The fork-choice spec test
-    /// `test_same_slot_equivocating_attesters_count_once` depends on this.
-    /// HashMap iteration would make this RandomState-seeded and flaky.
+    /// (same-slot equivocation), the vote with the larger canonical
+    /// attestation-data root must win for the validators present in both,
+    /// regardless of arrival/insertion order. This is the deterministic
+    /// fork-choice tiebreak (leanSpec #1181): it makes the extracted head a pure
+    /// function of pool contents, so two nodes that see the same votes in
+    /// different orders agree on the same head.
     #[test]
-    fn extract_latest_attestations_first_inserted_wins_on_slot_tie() {
+    fn extract_latest_attestations_canonical_root_wins_on_slot_tie() {
         let target_a = H256([0xaa; 32]);
         let target_b = H256([0xbb; 32]);
         let data_a = make_att_data_for_target(3, target_a);
         let data_b = make_att_data_for_target(3, target_b);
-        assert_ne!(data_a.hash_tree_root(), data_b.hash_tree_root());
+        // The pool keys the tie on `hash_tree_root(data)`, not on the target root.
+        let root_a = data_a.hash_tree_root();
+        let root_b = data_b.hash_tree_root();
+        assert_ne!(root_a, root_b);
 
-        // Order 1: A then B → validators 0,1 (in both) must see A.
-        let mut buf = PayloadBuffer::new(10);
-        buf.push(
-            HashedAttestationData::new(data_a.clone()),
-            make_proof_for_validators(&[0, 1, 2]),
-        );
-        buf.push(
-            HashedAttestationData::new(data_b.clone()),
-            make_proof_for_validators(&[0, 1, 3, 4]),
-        );
-        let extracted = buf.extract_latest_attestations();
-        assert_eq!(extracted[&0].target.root, target_a);
-        assert_eq!(extracted[&1].target.root, target_a);
-        assert_eq!(extracted[&2].target.root, target_a);
-        assert_eq!(extracted[&3].target.root, target_b);
-        assert_eq!(extracted[&4].target.root, target_b);
+        // The larger canonical root is the deterministic winner for shared voters.
+        let winner_target = if root_a > root_b { target_a } else { target_b };
 
-        // Order 2: B then A → validators 0,1 must now see B.
-        let mut buf = PayloadBuffer::new(10);
-        buf.push(
-            HashedAttestationData::new(data_b),
-            make_proof_for_validators(&[0, 1, 3, 4]),
-        );
-        buf.push(
-            HashedAttestationData::new(data_a),
-            make_proof_for_validators(&[0, 1, 2]),
-        );
-        let extracted = buf.extract_latest_attestations();
-        assert_eq!(extracted[&0].target.root, target_b);
-        assert_eq!(extracted[&1].target.root, target_b);
-        assert_eq!(extracted[&2].target.root, target_a);
-        assert_eq!(extracted[&3].target.root, target_b);
-        assert_eq!(extracted[&4].target.root, target_b);
+        // Deliver the same equivocating votes in both arrival orders; the winner
+        // for validators present in both aggregations (0, 1) must be identical.
+        for insert_b_first in [false, true] {
+            let mut buf = PayloadBuffer::new(10);
+            if insert_b_first {
+                buf.push(
+                    HashedAttestationData::new(data_b.clone()),
+                    make_proof_for_validators(&[0, 1, 3, 4]),
+                );
+                buf.push(
+                    HashedAttestationData::new(data_a.clone()),
+                    make_proof_for_validators(&[0, 1, 2]),
+                );
+            } else {
+                buf.push(
+                    HashedAttestationData::new(data_a.clone()),
+                    make_proof_for_validators(&[0, 1, 2]),
+                );
+                buf.push(
+                    HashedAttestationData::new(data_b.clone()),
+                    make_proof_for_validators(&[0, 1, 3, 4]),
+                );
+            }
+            let extracted = buf.extract_latest_attestations();
+            // Shared validators: deterministic canonical winner, independent of order.
+            assert_eq!(extracted[&0].target.root, winner_target);
+            assert_eq!(extracted[&1].target.root, winner_target);
+            // Exclusive validators keep their only vote.
+            assert_eq!(extracted[&2].target.root, target_a);
+            assert_eq!(extracted[&3].target.root, target_b);
+            assert_eq!(extracted[&4].target.root, target_b);
+        }
     }
 
     /// `drain` must hand back entries in insertion order so that
@@ -2356,7 +2695,7 @@ mod tests {
     // ============ GossipSignatureBuffer Tests ============
 
     fn make_dummy_sig() -> ValidatorSignature {
-        use ethlambda_types::signature::LeanSignatureScheme;
+        use ethlambda_crypto::signature::LeanSignatureScheme;
         use leansig::{serialization::Serializable, signature::SignatureScheme};
         use rand::{SeedableRng, rngs::StdRng};
 
@@ -2543,9 +2882,10 @@ mod tests {
         let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
         let store = Store::from_anchor_state(backend, State::from_genesis(0, vec![]));
 
-        let head_root = store.head();
+        let head_root = store.head().expect("head root must exist");
         let signed = store
             .get_signed_block(&head_root)
+            .expect("genesis block must be retrievable with synthetic proof")
             .expect("genesis block must be retrievable with synthetic proof");
 
         assert_eq!(signed.message.slot, 0);
@@ -2578,7 +2918,23 @@ mod tests {
         batch.commit().expect("commit");
 
         let store = Store::from_anchor_state(backend, State::from_genesis(0, vec![]));
-        assert!(store.get_signed_block(&root).is_none());
+        assert!(
+            store
+                .get_signed_block(&root)
+                .expect("Failed to get signed block")
+                .is_none()
+        );
+    }
+
+    /// The bootstrap anchor is stored as a full snapshot in `States`, the base of
+    /// every diff chain that reconstruction terminates at.
+    #[test]
+    fn from_anchor_state_stores_bootstrap_snapshot() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let store = Store::from_anchor_state(backend.clone(), State::from_genesis(0, vec![]));
+
+        let anchor_root = store.head().expect("Failed to get head block root");
+        assert!(has_key(backend.as_ref(), Table::States, &anchor_root));
     }
 
     // ============ from_db_state Tests ============
@@ -2586,7 +2942,11 @@ mod tests {
     #[test]
     fn from_db_state_returns_none_on_empty_backend() {
         let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
-        assert!(Store::from_db_state(backend, 12345).is_none());
+        assert!(
+            Store::from_db_state(backend, 12345)
+                .expect("Failed to get store")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2594,7 +2954,11 @@ mod tests {
         let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
         // Write an initial state to the backend.
         let _ = Store::from_anchor_state(backend.clone(), State::from_genesis(12345, vec![]));
-        assert!(Store::from_db_state(backend, 12345).is_some());
+        assert!(
+            Store::from_db_state(backend, 12345)
+                .expect("Failed to get store")
+                .is_some()
+        );
     }
 
     #[test]
@@ -2602,7 +2966,11 @@ mod tests {
         let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
         // Write an initial state to the backend.
         let _ = Store::from_anchor_state(backend.clone(), State::from_genesis(12345, vec![]));
-        assert!(Store::from_db_state(backend, 99999).is_none());
+        assert!(
+            Store::from_db_state(backend, 99999)
+                .expect("Failed to get store")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2620,6 +2988,10 @@ mod tests {
             )
             .expect("put config");
         batch.commit().expect("commit");
-        assert!(Store::from_db_state(backend, 12345).is_none());
+        assert!(
+            Store::from_db_state(backend, 12345)
+                .expect("Failed to get store")
+                .is_none()
+        );
     }
 }

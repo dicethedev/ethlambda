@@ -1,32 +1,40 @@
 use std::net::{IpAddr, SocketAddr};
 
-use axum::{
-    Extension, Json, Router,
-    http::{HeaderValue, StatusCode, header},
-    response::IntoResponse,
-    routing::get,
-};
+use axum::{Extension, Router};
+use ethlambda_blockchain::{EventBus, SyncStatusController};
 use ethlambda_storage::Store;
 use ethlambda_types::aggregator::AggregatorController;
-use ethlambda_types::primitives::H256;
-use libssz::SszEncode;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 pub(crate) const SSZ_CONTENT_TYPE: &str = "application/octet-stream";
 
 mod admin;
+mod base;
 mod blocks;
+mod events;
 mod fork_choice;
+mod genesis;
 mod heap_profiling;
 pub mod metrics;
+mod node;
+mod spec;
 pub mod test_driver;
+
+pub(crate) use base::json_response;
 
 #[derive(Debug, Clone)]
 pub struct RpcConfig {
     pub http_address: IpAddr,
     pub api_port: u16,
     pub metrics_port: u16,
+    /// Full client version string, as printed by `ethlambda --version`.
+    ///
+    /// Served verbatim by `GET /lean/v0/node/identity`. It carries git and
+    /// rustc build metadata that only the binary crate can produce (via its
+    /// `build.rs`), so the binary supplies it here rather than the `net/rpc`
+    /// crate building it itself.
+    pub version: &'static str,
 }
 
 /// Start the RPC server in Hive test-driver mode.
@@ -55,9 +63,15 @@ pub async fn start_rpc_server(
     config: RpcConfig,
     store: Store,
     aggregator: AggregatorController,
+    sync_status: SyncStatusController,
+    peer_id: String,
+    events: EventBus,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
-    let api_router = build_api_router(store).layer(Extension(aggregator));
+    let api_router = build_api_router(store, config.version, peer_id)
+        .layer(Extension(aggregator))
+        .layer(Extension(sync_status))
+        .layer(Extension(events));
     let metrics_router = metrics::start_prometheus_metrics_api();
     let debug_router = build_debug_router();
 
@@ -93,39 +107,29 @@ pub async fn start_rpc_server(
     Ok(())
 }
 
-/// Build the API router with the given store.
+/// Build the API router with the given store, client version, and peer ID.
 ///
-/// The aggregator controller is threaded in via `Extension` by the caller
-/// (see `start_rpc_server`) so existing store-backed handlers don't need to
-/// know about it and admin handlers extract it independently.
-fn build_api_router(store: Store) -> Router {
+/// `version` (`RpcConfig::version`) and `peer_id` (the node's libp2p peer ID)
+/// are captured by the `/lean/v0/node/identity` route so it can report them.
+/// The aggregator controller is threaded in separately via `Extension` by the
+/// caller (see `start_rpc_server`) so existing store-backed handlers don't need
+/// to know about it and admin handlers extract it independently.
+fn build_api_router(store: Store, version: &'static str, peer_id: String) -> Router {
     Router::new()
-        .route("/lean/v0/health", get(metrics::get_health))
-        .route("/lean/v0/states/finalized", get(get_latest_finalized_state))
-        .route("/lean/v0/blocks/finalized", get(get_latest_finalized_block))
-        .route(
-            "/lean/v0/checkpoints/justified",
-            get(get_latest_justified_state),
-        )
-        .route("/lean/v0/fork_choice", get(fork_choice::get_fork_choice))
-        .route(
-            "/lean/v0/fork_choice/ui",
-            get(fork_choice::get_fork_choice_ui),
-        )
-        .route("/lean/v0/blocks/{block_id}", get(blocks::get_block))
-        .route(
-            "/lean/v0/blocks/{block_id}/header",
-            get(blocks::get_block_header),
-        )
-        .route(
-            "/lean/v0/admin/aggregator",
-            get(admin::get_aggregator).post(admin::post_aggregator),
-        )
+        .merge(base::routes())
+        .merge(blocks::routes())
+        .merge(events::routes())
+        .merge(fork_choice::routes())
+        .merge(admin::routes())
+        .merge(node::routes(version, peer_id))
+        .merge(genesis::routes())
+        .merge(spec::routes())
         .with_state(store)
 }
 
 /// Build the debug router for profiling endpoints.
 fn build_debug_router() -> Router {
+    use axum::routing::get;
     Router::new()
         .route("/debug/pprof/allocs", get(heap_profiling::handle_get_heap))
         .route(
@@ -134,62 +138,10 @@ fn build_debug_router() -> Router {
         )
 }
 
-async fn get_latest_finalized_state(
-    axum::extract::State(store): axum::extract::State<Store>,
-) -> impl IntoResponse {
-    let finalized = store.latest_finalized();
-    let mut state = store
-        .get_state(&finalized.root)
-        .expect("finalized state exists");
-
-    // Zero state_root to match the canonical post-state representation.
-    // The spec's state_transition sets state_root to zero during process_block_header,
-    // and only fills it in lazily at the next slot's process_slots.
-    // Serving the canonical form ensures checkpoint sync interoperability.
-    state.latest_block_header.state_root = H256::ZERO;
-
-    ssz_response(state.to_ssz())
-}
-
-async fn get_latest_finalized_block(
-    axum::extract::State(store): axum::extract::State<Store>,
-) -> impl IntoResponse {
-    let finalized = store.latest_finalized();
-    // Returns 404 for genesis since it doesn't have a valid signature
-    match store.get_signed_block(&finalized.root) {
-        Some(block) => ssz_response(block.to_ssz()),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
-}
-
-async fn get_latest_justified_state(
-    axum::extract::State(store): axum::extract::State<Store>,
-) -> impl IntoResponse {
-    let checkpoint = store.latest_justified();
-    json_response(checkpoint)
-}
-
-fn json_response<T: serde::Serialize>(value: T) -> axum::response::Response {
-    let mut response = Json(value).into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(JSON_CONTENT_TYPE),
-    );
-    response
-}
-
-fn ssz_response(bytes: Vec<u8>) -> axum::response::Response {
-    let mut response = bytes.into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(SSZ_CONTENT_TYPE),
-    );
-    response
-}
-
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use ethlambda_storage::{StorageBackend, Table};
+    use axum::Router;
+    use ethlambda_storage::{StorageBackend, Store, Table};
     use ethlambda_types::{
         block::{Block, BlockBody, BlockHeader},
         checkpoint::Checkpoint,
@@ -197,6 +149,13 @@ pub(crate) mod test_utils {
         state::{ChainConfig, JustificationValidators, JustifiedSlots, State},
     };
     use libssz::SszEncode;
+
+    /// Build the API router the way tests do, with placeholder client version
+    /// and peer ID. Tests that assert on those identity values (e.g. the
+    /// `/lean/v0/node/identity` test) call `crate::build_api_router` directly.
+    pub(crate) fn test_api_router(store: Store) -> Router {
+        crate::build_api_router(store, "ethlambda/test", "test-peer".to_string())
+    }
 
     /// Create a minimal test state for testing.
     pub(crate) fn create_test_state() -> State {
@@ -267,7 +226,7 @@ pub(crate) mod test_utils {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::Request};
+    use axum::{body::Body, http::Request, http::StatusCode, http::header};
     use ethlambda_storage::{ForkCheckpoints, Store, backend::InMemoryBackend};
     use http_body_util::BodyExt;
     use serde_json::json;
@@ -282,7 +241,7 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let store = Store::from_anchor_state(backend, state);
 
-        let app = build_api_router(store.clone());
+        let app = test_utils::test_api_router(store.clone());
 
         let response = app
             .oneshot(
@@ -300,7 +259,9 @@ mod tests {
         let checkpoint: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         // The justified checkpoint should match the store's latest justified
-        let expected = store.latest_justified();
+        let expected = store
+            .latest_justified()
+            .expect("latest justified checkpoint exists");
         assert_eq!(
             checkpoint,
             json!({
@@ -319,12 +280,17 @@ mod tests {
         let store = Store::from_anchor_state(backend, state);
 
         // Build expected SSZ with zeroed state_root (canonical post-state form)
-        let finalized = store.latest_finalized();
-        let mut expected_state = store.get_state(&finalized.root).unwrap();
+        let finalized = store
+            .latest_finalized()
+            .expect("latest finalized checkpoint exists");
+        let mut expected_state = store
+            .get_state(&finalized.root)
+            .expect("expected state")
+            .unwrap();
         expected_state.latest_block_header.state_root = H256::ZERO;
         let expected_ssz = expected_state.to_ssz();
 
-        let app = build_api_router(store);
+        let app = test_utils::test_api_router(store);
 
         let response = app
             .oneshot(
@@ -395,7 +361,7 @@ mod tests {
             let anchor_root = anchor_root_of(&state);
             let backend = Arc::new(InMemoryBackend::new());
             let store = Store::from_anchor_state(backend, state);
-            let app = build_api_router(store);
+            let app = test_utils::test_api_router(store);
 
             let response = send(app, &format!("/lean/v0/blocks/0x{anchor_root:x}")).await;
 
@@ -416,7 +382,7 @@ mod tests {
             let anchor_root = anchor_root_of(&state);
             let backend = Arc::new(InMemoryBackend::new());
             let store = Store::from_anchor_state(backend, state);
-            let app = build_api_router(store);
+            let app = test_utils::test_api_router(store);
 
             let response = send(app, &format!("/lean/v0/blocks/0x{anchor_root:x}/header")).await;
 
@@ -432,7 +398,7 @@ mod tests {
         #[tokio::test]
         async fn get_block_by_slot_returns_json() {
             let (store, _target_root) = store_with_historical_block();
-            let app = build_api_router(store);
+            let app = test_utils::test_api_router(store);
 
             let response = send(app, "/lean/v0/blocks/1").await;
 
@@ -449,7 +415,7 @@ mod tests {
             let state = create_test_state();
             let backend = Arc::new(InMemoryBackend::new());
             let store = Store::from_anchor_state(backend, state);
-            let app = build_api_router(store);
+            let app = test_utils::test_api_router(store);
 
             let response = send(app, "/lean/v0/blocks/not-a-valid-id").await;
 
@@ -461,7 +427,7 @@ mod tests {
             let state = create_test_state();
             let backend = Arc::new(InMemoryBackend::new());
             let store = Store::from_anchor_state(backend, state);
-            let app = build_api_router(store);
+            let app = test_utils::test_api_router(store);
 
             let missing = format!("0x{}", "aa".repeat(32));
             let response = send(app, &format!("/lean/v0/blocks/{missing}")).await;
@@ -472,7 +438,7 @@ mod tests {
         #[tokio::test]
         async fn get_block_missing_slot_returns_404() {
             let (store, _) = store_with_historical_block();
-            let app = build_api_router(store);
+            let app = test_utils::test_api_router(store);
 
             let response = send(app, "/lean/v0/blocks/999").await;
 
@@ -482,7 +448,7 @@ mod tests {
         #[tokio::test]
         async fn get_block_empty_slot_returns_404() {
             let (store, _) = store_with_historical_block();
-            let app = build_api_router(store);
+            let app = test_utils::test_api_router(store);
 
             // Slot 0 in the test setup is H256::ZERO (empty).
             let response = send(app, "/lean/v0/blocks/0").await;
@@ -508,7 +474,10 @@ mod tests {
         let block = Block {
             slot: 1,
             proposer_index: 0,
-            parent_root: store.latest_finalized().root,
+            parent_root: store
+                .latest_finalized()
+                .expect("latest finalized checkpoint exists")
+                .root,
             state_root: H256::ZERO,
             body: BlockBody::default(),
         };
@@ -519,19 +488,23 @@ mod tests {
         };
 
         // Persist the signed block and mark it as the latest finalized checkpoint.
-        store.insert_signed_block(block_root, signed_block.clone());
-        store.update_checkpoints(ForkCheckpoints::new(
-            block_root,
-            None,
-            Some(Checkpoint {
-                root: block_root,
-                slot: 1,
-            }),
-        ));
+        store
+            .insert_signed_block(block_root, signed_block.clone())
+            .expect("insert_signed_block should succeed");
+        store
+            .update_checkpoints(ForkCheckpoints::new(
+                block_root,
+                None,
+                Some(Checkpoint {
+                    root: block_root,
+                    slot: 1,
+                }),
+            ))
+            .expect("update_checkpoints should succeed");
 
         let expected_ssz = signed_block.to_ssz();
 
-        let app = build_api_router(store);
+        let app = test_utils::test_api_router(store);
 
         let response = app
             .oneshot(
@@ -570,15 +543,21 @@ mod tests {
         // matching the genesis header paired with the synthetic blank proof —
         // same shape `get_signed_block` builds in storage.
         let genesis_block = store
-            .get_signed_block(&store.latest_finalized().root)
-            .expect("genesis served via get_signed_block");
+            .get_signed_block(
+                &store
+                    .latest_finalized()
+                    .expect("latest finalized checkpoint exists")
+                    .root,
+            )
+            .expect("genesis served via get_signed_block")
+            .unwrap();
         let expected = SignedBlock {
             message: genesis_block.message.clone(),
             proof: MultiMessageAggregate::default(),
         };
         let expected_ssz = expected.to_ssz();
 
-        let app = build_api_router(store);
+        let app = test_utils::test_api_router(store);
 
         let response = app
             .oneshot(

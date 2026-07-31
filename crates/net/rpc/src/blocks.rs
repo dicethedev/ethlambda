@@ -1,7 +1,9 @@
 use axum::{
+    Router,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
+    routing::get,
 };
 use ethlambda_storage::Store;
 use ethlambda_types::primitives::H256;
@@ -9,10 +11,16 @@ use serde_json::json;
 
 use crate::json_response;
 
+pub(crate) fn routes() -> Router<Store> {
+    Router::new()
+        .route("/lean/v0/blocks/{block_id}", get(get_block))
+        .route("/lean/v0/blocks/{block_id}/header", get(get_block_header))
+}
+
 /// `GET /lean/v0/blocks/:block_id` — returns the block as JSON.
 ///
 /// `block_id` can be a `0x`-prefixed 32-byte hex root or a decimal slot.
-pub async fn get_block(
+pub(crate) async fn get_block(
     Path(block_id): Path<String>,
     State(store): State<Store>,
 ) -> impl IntoResponse {
@@ -22,13 +30,14 @@ pub async fn get_block(
     };
 
     match store.get_block(&root) {
-        Some(block) => json_response(block),
-        None => BlockIdError::NotFound.into_response(),
+        Ok(Some(block)) => json_response(block),
+        Ok(None) => BlockIdError::NotFound.into_response(),
+        Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
 /// `GET /lean/v0/blocks/:block_id/header` — returns the block header as JSON.
-pub async fn get_block_header(
+pub(crate) async fn get_block_header(
     Path(block_id): Path<String>,
     State(store): State<Store>,
 ) -> impl IntoResponse {
@@ -38,8 +47,9 @@ pub async fn get_block_header(
     };
 
     match store.get_block_header(&root) {
-        Some(header) => json_response(header),
-        None => BlockIdError::NotFound.into_response(),
+        Ok(Some(header)) => json_response(header),
+        Ok(None) => BlockIdError::NotFound.into_response(),
+        Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 

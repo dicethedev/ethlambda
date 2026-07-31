@@ -2,9 +2,9 @@ pub mod aggregator;
 pub mod attestation;
 pub mod block;
 pub mod checkpoint;
+pub mod constants;
 pub mod genesis;
 pub mod primitives;
-pub mod signature;
 pub mod state;
 
 /// Display helper for truncated root hashes (8 hex chars)

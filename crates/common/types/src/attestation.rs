@@ -4,10 +4,9 @@ use libssz_types::{SszBitlist, SszVector};
 use serde::{Serialize, Serializer};
 
 use crate::{
-    block::TypeOneMultiSignature,
+    block::SingleMessageAggregate,
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
-    signature::SIGNATURE_SIZE,
 };
 
 /// Validator specific attestation wrapping shared attestation data.
@@ -54,6 +53,13 @@ pub struct SignedAttestation {
     /// Signature aggregation produced by the leanVM (SNARKs in the future).
     pub signature: XmssSignature,
 }
+
+/// Size of an XMSS signature in bytes.
+///
+/// Computed from: path(32*8*4) + rho(7*4) + hashes(46*8*4) + ssz_offsets(3*4) = 2536.
+/// This is the SSZ wire size, independent of the `leansig` scheme itself, so it
+/// lives here (leansig-free) rather than in `ethlambda-crypto`.
+pub const SIGNATURE_SIZE: usize = 2536;
 
 /// XMSS signature as a fixed-length byte vector (`SIGNATURE_SIZE` bytes).
 pub type XmssSignature = SszVector<u8, SIGNATURE_SIZE>;
@@ -148,13 +154,13 @@ pub fn bits_is_subset(a: &AggregationBits, b: &AggregationBits) -> bool {
 
 /// Aggregated attestation with its signature proof, used for gossip on the aggregation topic.
 ///
-/// The `proof` carries a Type-1 single-message multi-signer aggregate: the
-/// signed message is the attestation data root, participants live in
+/// The `proof` carries a single-message multi-signer aggregate: the signed
+/// message is the attestation data root, participants live in
 /// `proof.participants`, and the raw aggregate bytes are in `proof.proof`.
 #[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
 pub struct SignedAggregatedAttestation {
     pub data: AttestationData,
-    pub proof: TypeOneMultiSignature,
+    pub proof: SingleMessageAggregate,
 }
 
 /// Attestation data paired with its precomputed tree hash root.

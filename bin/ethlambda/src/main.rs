@@ -1,4 +1,5 @@
 mod checkpoint_sync;
+mod cli;
 mod fd_limit;
 mod version;
 
@@ -31,15 +32,19 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 use clap::Parser;
+use cli::CliOptions;
 use ethlambda_blockchain::MILLISECONDS_PER_SLOT;
+use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
+use ethlambda_crypto::signature::ValidatorSecretKey;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
-use ethlambda_p2p::{Bootnode, P2P, PeerId, SwarmConfig, build_swarm, parse_enrs};
+use ethlambda_p2p::{
+    Bootnode, P2P, PeerId, SwarmConfig, attestation_subscription_subnets, build_swarm, parse_enrs,
+};
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::{
     aggregator::AggregatorController,
     genesis::GenesisConfig,
-    signature::ValidatorSecretKey,
     state::{State, ValidatorPubkeyBytes},
 };
 use eyre::WrapErr;
@@ -47,7 +52,7 @@ use serde::Deserialize;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
-use ethlambda_blockchain::BlockChain;
+use ethlambda_blockchain::{BlockChain, BlockChainConfig, EventBus, SyncStatusController};
 use ethlambda_rpc::RpcConfig;
 use ethlambda_storage::{
     MAX_RESUMABLE_DB_STATE_AGE, StorageBackend, Store, backend::RocksDBBackend,
@@ -60,78 +65,6 @@ const ASCII_ART: &str = r#"
 |  __/ |_| | | | | (_| | | | | | | |_) | (_| | (_| |
  \___|\__|_| |_|_|\__,_|_| |_| |_|_.__/ \__,_|\__,_|
 "#;
-
-#[derive(Debug, clap::Parser)]
-#[command(name = "ethlambda", author = "LambdaClass", version = version::CLIENT_VERSION, about = "ethlambda consensus client")]
-struct CliOptions {
-    /// Path to the chain genesis config (e.g., config.yaml).
-    #[arg(long)]
-    genesis: PathBuf,
-    /// Path to the validator registry (e.g., annotated_validators.yaml).
-    #[arg(long)]
-    validators: PathBuf,
-    /// Path to the bootnode list (e.g., nodes.yaml).
-    #[arg(long)]
-    bootnodes: PathBuf,
-    /// Path to validator-config.yaml (validator name registry for metrics labels).
-    #[arg(long)]
-    validator_config: PathBuf,
-    /// Directory containing per-validator XMSS keys (e.g., hash-sig-keys/).
-    #[arg(long)]
-    hash_sig_keys_dir: PathBuf,
-    #[arg(long, default_value = "9000")]
-    gossipsub_port: u16,
-    #[arg(long, default_value = "127.0.0.1")]
-    http_address: IpAddr,
-    #[arg(long, default_value = "5052")]
-    api_port: u16,
-    #[arg(long, default_value = "5054")]
-    metrics_port: u16,
-    #[arg(long)]
-    node_key: PathBuf,
-    /// The node ID to look up in annotated_validators.yaml (e.g., "ethlambda_0")
-    #[arg(long)]
-    node_id: String,
-    /// Base URL(s) of checkpoint-sync peer API servers (e.g., http://peer:5052).
-    /// When set, skips genesis initialization and fetches the finalized state
-    /// and block from each peer's `/lean/v0/states/finalized` and
-    /// `/lean/v0/blocks/finalized` endpoints. For backward compatibility, a
-    /// URL ending in `/lean/v0/states/finalized` is accepted and the trailing
-    /// path is stripped.
-    ///
-    /// Multiple URLs may be supplied for redundancy, either comma-separated
-    /// (`--checkpoint-sync-url u1,u2`) or by repeating the flag
-    /// (`--checkpoint-sync-url u1 --checkpoint-sync-url u2`). URLs are tried
-    /// in order; the first one that succeeds is used and any failures fall
-    /// over to the next URL. Startup only aborts if every URL fails.
-    #[arg(long, value_delimiter = ',')]
-    checkpoint_sync_url: Vec<String>,
-    /// Whether this node acts as a committee aggregator.
-    ///
-    /// Seeds the initial value of the live aggregator flag shared by the
-    /// blockchain actor and the admin API. The flag can be toggled at
-    /// runtime via `POST /lean/v0/admin/aggregator`. Runtime toggles do
-    /// NOT persist across restarts and do NOT update gossip subnet
-    /// subscriptions, which are frozen at startup — standby aggregators
-    /// should boot with this flag enabled to establish subscriptions, then
-    /// use the admin endpoint to rotate duties (hot-standby model).
-    #[arg(long, default_value = "false")]
-    is_aggregator: bool,
-    /// Number of attestation committees (subnets) per slot.
-    ///
-    /// If unset, falls back to `config.attestation_committee_count` from
-    /// `validator-config.yaml` in the network config dir, or `1` if that
-    /// field is also absent.
-    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
-    attestation_committee_count: Option<u64>,
-    /// Subnet IDs this aggregator should subscribe to (comma-separated).
-    /// Requires --is-aggregator. Defaults to the subnets of the node's validators.
-    #[arg(long, value_delimiter = ',', requires = "is_aggregator")]
-    aggregate_subnet_ids: Option<Vec<u64>>,
-    /// Directory for RocksDB storage
-    #[arg(long, default_value = "./data")]
-    data_dir: PathBuf,
-}
 
 // Shadow single-steps execution in a discrete-event simulation, so the default
 // multi-threaded runtime's worker threads add only scheduling noise, never
@@ -149,6 +82,9 @@ async fn main() -> eyre::Result<()> {
 
     let options = CliOptions::parse();
 
+    #[cfg(feature = "shadow-integration")]
+    init_shadow_cost(&options.shadow);
+
     // Initialize metrics
     ethlambda_blockchain::metrics::init();
     ethlambda_blockchain::metrics::set_node_info("ethlambda", version::CLIENT_VERSION);
@@ -158,6 +94,7 @@ async fn main() -> eyre::Result<()> {
         http_address: options.http_address,
         api_port: options.api_port,
         metrics_port: options.metrics_port,
+        version: version::CLIENT_VERSION,
     };
 
     println!("{ASCII_ART}");
@@ -279,28 +216,63 @@ async fn main() -> eyre::Result<()> {
     // and the API server (which exposes GET/POST admin endpoints).
     let aggregator = AggregatorController::new(options.is_aggregator);
 
+    // Attestation subnets this node subscribes to, computed once and shared by
+    // the P2P swarm (to open gossip subscriptions) and the blockchain actor
+    // (to size the early-aggregation threshold), so both agree on which subnets
+    // feed this node's gossip groups. Subscriptions are fixed at startup and
+    // are not re-evaluated when the aggregator role is toggled at runtime; see
+    // the hot-standby note on SwarmConfig.
+    let subscribed_subnets = attestation_subscription_subnets(
+        &validator_ids,
+        attestation_committee_count,
+        options.is_aggregator,
+        options.aggregate_subnet_ids.as_deref(),
+    );
+
+    // Shared, runtime-readable sync status. The blockchain actor writes it each
+    // tick (alongside the `lean_node_sync_status` metric); the RPC
+    // `/lean/v0/node/syncing` endpoint reads it. Seeded to Idle, matching the
+    // metric's startup value.
+    let sync_status = SyncStatusController::default();
+
+    // Chain-event bus: the blockchain actor is the sole publisher; each SSE
+    // client (`GET /lean/v0/events`) subscribes its own receiver through the
+    // clone handed to the RPC server below. With no subscribers attached, the
+    // receiver-count guard in `emit` makes every emission a no-op.
+    let events = EventBus::default();
+
+    let blockchain_config = BlockChainConfig {
+        aggregator: aggregator.clone(),
+        sync_status_controller: sync_status.clone(),
+        attestation_committee_count,
+        gate_duties: !options.disable_duty_sync_gate,
+        subscribed_subnets: subscribed_subnets.clone(),
+        proposer_config: ProposerConfig {
+            enable_proposer_aggregation: options.enable_proposer_aggregation,
+            max_attestations_per_block: options.max_attestations_per_block,
+        },
+    };
+
     let blockchain = BlockChain::spawn(
         store.clone(),
         validator_keys,
-        aggregator.clone(),
-        attestation_committee_count,
+        blockchain_config,
+        events.clone(),
     );
 
-    // Note: SwarmConfig.is_aggregator is intentionally a plain bool, not the
-    // AggregatorController — subnet subscriptions are decided once here and
-    // are not re-evaluated at runtime. Toggling via the admin API affects
-    // aggregation logic but not the gossip mesh. See crates/net/p2p/src/lib.rs
-    // for the invariant.
     let built = build_swarm(SwarmConfig {
         node_key: node_p2p_key,
         bootnodes,
         listening_socket: p2p_socket,
         validator_ids,
         attestation_committee_count,
-        is_aggregator: options.is_aggregator,
-        aggregate_subnet_ids: options.aggregate_subnet_ids,
+        subscription_subnets: subscribed_subnets,
     })
     .wrap_err("failed to build swarm")?;
+
+    // Capture the local peer ID before `built` is moved into the P2P actor; the
+    // RPC `/lean/v0/node/identity` endpoint reports it.
+    let local_peer_id = built.local_peer_id.to_string();
 
     let p2p = P2P::spawn(built, store.clone(), node_names);
 
@@ -323,9 +295,17 @@ async fn main() -> eyre::Result<()> {
     let rpc_shutdown = shutdown_token.clone();
 
     let rpc_handle = tokio::spawn(async move {
-        let _ = ethlambda_rpc::start_rpc_server(rpc_config, store, aggregator, rpc_shutdown)
-            .await
-            .inspect_err(|err| error!(%err, "RPC server failed"));
+        let _ = ethlambda_rpc::start_rpc_server(
+            rpc_config,
+            store,
+            aggregator,
+            sync_status,
+            local_peer_id,
+            events,
+            rpc_shutdown,
+        )
+        .await
+        .inspect_err(|err| error!(%err, "RPC server failed"));
     });
 
     info!("Node initialized");
@@ -363,6 +343,30 @@ async fn main() -> eyre::Result<()> {
     info!("Shutdown complete");
 
     Ok(())
+}
+
+/// Apply the Shadow-simulator sim-cost / fake-XMSS configuration from the CLI.
+///
+/// Compiled only under the `shadow-integration` feature. Call once at startup,
+/// before any consensus/aggregation work, so the fake-proof and sim-cost hooks
+/// are installed before the first signing or aggregation path runs.
+#[cfg(feature = "shadow-integration")]
+fn init_shadow_cost(shadow: &cli::ShadowOptions) {
+    info!(
+        fake = shadow.shadow_xmss_fake,
+        aggregate_rate = ?shadow.shadow_xmss_aggregate_signatures_rate,
+        verify_rate = ?shadow.shadow_xmss_verify_aggregated_signatures_rate,
+        merge_rate = ?shadow.shadow_xmss_merge_rate,
+        fake_proof_size = shadow.shadow_xmss_fake_proof_size,
+        "Applying Shadow XMSS sim-cost / fake-XMSS config"
+    );
+    ethlambda_crypto::shadow_cost::init(
+        shadow.shadow_xmss_fake,
+        shadow.shadow_xmss_aggregate_signatures_rate,
+        shadow.shadow_xmss_verify_aggregated_signatures_rate,
+        shadow.shadow_xmss_merge_rate,
+        shadow.shadow_xmss_fake_proof_size as usize,
+    );
 }
 
 /// Boot the binary in Hive test-driver mode.
@@ -679,31 +683,31 @@ async fn fetch_initial_state(
     // Checkpoint sync path
 
     // Prefer resuming from a fresh on-disk state to avoid re-downloading what we already have.
-    if let Some(store) = Store::from_db_state(backend.clone(), genesis.genesis_time) {
+    if let Ok(Some(store)) = Store::from_db_state(backend.clone(), genesis.genesis_time) {
         let now_ms = SystemTime::UNIX_EPOCH
             .elapsed()
             .expect("already past the unix epoch")
             .as_millis() as u64;
         let current_slot =
             now_ms.saturating_sub(genesis.genesis_time * 1000) / MILLISECONDS_PER_SLOT;
-        let finalized_slot = store.latest_finalized().slot;
-        let gap = current_slot.saturating_sub(finalized_slot);
+        let head_slot = store.head_slot();
+        let gap = current_slot.saturating_sub(head_slot);
         if gap <= MAX_RESUMABLE_DB_STATE_AGE {
             info!(
-                finalized_slot,
+                head_slot,
                 current_slot, gap, "Resuming from existing DB state"
             );
             return Ok(store);
         }
         warn!(
-            finalized_slot,
+            head_slot,
             current_slot, gap, "Existing DB state is stale; falling through to checkpoint sync"
         );
     }
 
     info!(?checkpoint_urls, "Starting checkpoint sync");
 
-    let (state, signed_block) = checkpoint_sync::fetch_anchor_block_and_state(
+    let (state, signed_block) = checkpoint_sync::fetch_anchor_with_retry(
         checkpoint_urls,
         genesis.genesis_time,
         &validators,
@@ -726,7 +730,10 @@ async fn fetch_initial_state(
     let mut store = Store::get_forkchoice_store(backend, state, signed_block.message.clone())
         .inspect_err(|err| error!(%err, "Failed to initialize store from anchor state and block"))
         .map_err(|_| checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch)?;
-    store.insert_signed_block(anchor_root, signed_block);
+    store
+        .insert_signed_block(anchor_root, signed_block)
+        .inspect_err(|err| error!(%err, "Failed to insert anchor signed block into store"))
+        .map_err(|_| checkpoint_sync::CheckpointSyncError::StoreInsertSignedBlock)?;
     Ok(store)
 }
 

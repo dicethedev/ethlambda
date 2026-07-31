@@ -6,10 +6,10 @@ Not to be confused with Ethereum consensus clients AKA Beacon Chain clients AKA 
 ## Quick Reference
 
 **Main branch:** `main`
-**Rust version:** 1.92.0 (edition 2024)
+**Rust version:** 1.97.1 (edition 2024)
 **Test fixtures release:** Download latest production fixtures from leanSpec releases
 
-## Codebase Structure (10 crates)
+## Codebase Structure (12 workspace crates)
 
 ```
 bin/ethlambda/              # Entry point, CLI, orchestration
@@ -18,17 +18,24 @@ crates/
   blockchain/               # State machine actor (GenServer pattern)
     ├─ src/lib.rs           # BlockChain actor, tick events, validator duties
     ├─ src/store.rs         # Fork choice store, block/attestation processing
+    ├─ src/block_builder.rs # Block assembly (pre-built at previous slot's interval 4)
+    ├─ src/aggregation.rs   # Interval-2 signature aggregation worker
+    ├─ src/reaggregate.rs   # Re-aggregation of block-borne votes on import
+    ├─ src/sync_status.rs   # Sync-gate tracker (suppresses duties while syncing)
     ├─ src/key_manager.rs   # Validator key management and signing
     ├─ src/metrics.rs       # Blockchain-level Prometheus metrics
-    ├─ fork_choice/         # LMD GHOST implementation (3SF-mini)
-    └─ state_transition/    # STF: process_slots, process_block, attestations
+    ├─ fork_choice/         # [crate] LMD GHOST implementation (3SF-mini)
+    └─ state_transition/    # [crate] STF: process_slots, process_block, attestations
+        ├─ src/justified_slots_ops.rs  # Relative-index helpers for justified_slots
         └─ src/metrics.rs   # State transition timing + counters
   common/
     ├─ types/               # Core types (State, Block, Attestation, Checkpoint)
     ├─ crypto/              # XMSS aggregation (leansig wrapper)
-    └─ metrics/             # Prometheus re-exports, TimingGuard, gather utilities
+    ├─ metrics/             # Prometheus re-exports, TimingGuard, gather utilities
+    └─ test-fixtures/       # Spec-fixture loading (prod dep of rpc's Hive test driver)
   net/
-    ├─ p2p/                 # libp2p: gossipsub + req-resp (Status, BlocksByRoot)
+    ├─ api/                 # Actor protocol traits wiring BlockChain ↔ P2P
+    ├─ p2p/                 # libp2p: gossipsub + req-resp (Status, BlocksByRoot, BlocksByRange)
     │   ├─ src/gossipsub/   # Topic encoding, message handling
     │   ├─ src/req_resp/    # Request/response codec and handlers
     │   └─ src/metrics.rs   # Peer connection/disconnection tracking
@@ -47,21 +54,23 @@ crates/
 
 ### Tick-Based Validator Duties (4-second slots, 5 intervals per slot)
 ```
-Interval 0: Block proposal → accept attestations if proposal exists
+Interval 0: Block published (at the slot boundary). The build+publish code path is merged into the previous slot's interval 4 (see below) and aligned to publish here; no attestation acceptance happens at interval 0.
 Interval 1: Attestation production (all validators, including proposer)
 Interval 2: Aggregation (aggregators create proofs from gossip signatures)
 Interval 3: Safe target update (fork choice)
-Interval 4: Accept accumulated attestations
+Interval 4: Accept accumulated attestations; build the NEXT slot's block and publish it aligned to that slot's interval 0 (build and publish merged into this tick)
 ```
 
 ### Attestation Pipeline
 ```
-Gossip → Signature verification → new_attestations (pending)
+Gossip → Signature verification → new_payloads (pending)
   ↓ (intervals 0/4)
-promote → known_attestations (fork choice active)
+promote → known_payloads (fork choice active)
   ↓
 Fork choice head update
 ```
+(Store buffer fields are `new_payloads`/`known_payloads`; the accessors are named
+`extract_latest_new_attestations`/`extract_latest_known_attestations`.)
 
 ### State Transition Phases
 1. **process_slots()**: Advance through empty slots, update historical roots
@@ -105,7 +114,7 @@ let byte: u8 = code.into();
 
 ### Ownership for Large Structures
 ```rust
-// Prefer taking ownership to avoid cloning large data (signatures ~3KB)
+// Prefer taking ownership to avoid cloning large data (signatures ~2.5KB)
 pub fn insert_signed_block(&mut self, root: H256, signed_block: SignedBlock) { ... }
 
 // Add .clone() at call site if needed - makes cost explicit
@@ -252,7 +261,7 @@ actual_slot = finalized_slot + 1 + relative_index
 
 **XMSS (eXtended Merkle Signature Scheme):**
 - Post-quantum signature scheme
-- 52-byte public keys, 3112-byte signatures
+- 52-byte public keys, 2536-byte signatures (`SIGNATURE_SIZE` in `common/types/src/signature.rs`)
 - Epoch-based to prevent reuse
 - Aggregation via leanVM (previously leanMultisig) for efficiency
 
@@ -268,44 +277,18 @@ actual_slot = finalized_slot + 1 + relative_index
   - Topic: `/leanconsensus/{fork_digest}/{block|aggregation|attestation_N}/ssz_snappy`
   - `fork_digest` is a 4-byte hex string (no `0x` prefix); currently the dummy `12345678` agreed across clients
   - Mesh size: 8 (6-12 bounds), heartbeat: 700ms
-- **Req/Resp**: Status, BlocksByRoot (snappy frame compression + varint length)
+- **Req/Resp**: Status, BlocksByRoot, BlocksByRange (snappy frame compression + varint length)
 
 ### Retry Strategy on Block Requests
-- Exponential backoff: 10ms, 40ms, 160ms, 640ms, 2560ms
-- Max 5 attempts, random peer selection on retry
+- Exponential backoff: doubling from `INITIAL_BACKOFF_MS` (5ms → 2560ms)
+- Max `MAX_FETCH_RETRIES` (10) attempts, random peer selection on retry
 
 ### Message IDs
 - 20-byte truncated SHA256 of: domain (valid/invalid snappy) + topic + data
 
 ## HTTP Servers (API + Metrics)
 
-The RPC crate runs **two independent Axum servers** on separate ports, allowing different network policies for API and metrics.
-
-### CLI Flags
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--http-address` | `127.0.0.1` | Bind address shared by both servers |
-| `--api-port` | `5052` | API server port |
-| `--metrics-port` | `5054` | Metrics server port |
-
-### API Server (`:5052`)
-- `GET /lean/v0/health` — health check
-- `GET /lean/v0/states/finalized` — latest finalized state (SSZ)
-- `GET /lean/v0/checkpoints/justified` — justified checkpoint (JSON)
-- `GET /lean/v0/fork_choice` — fork choice tree (JSON)
-- `GET /lean/v0/fork_choice/ui` — interactive D3.js visualization
-- `GET /lean/v0/blocks/{block_id}` — block as JSON; `block_id` is a `0x`-prefixed 32-byte hex root or a decimal slot
-- `GET /lean/v0/blocks/{block_id}/header` — block header as JSON
-- Requires `Store` access
-
-### Metrics Server (`:5054`)
-- `GET /metrics` — Prometheus-compatible metrics endpoint
-- `GET /debug/pprof/allocs` — heap profiling
-- `GET /debug/pprof/allocs/flamegraph` — heap flamegraph
-- No store access needed (reads from global prometheus registry)
-
-### Startup
-Both servers are spawned as independent `tokio::spawn` tasks from `main.rs`. Bind failures are logged via `error!()` but do not crash the node.
+The RPC crate runs two independent Axum servers (API on `:5052`, metrics/debug on `:5054`). See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults, the API endpoints (health, finalized state/block, justified checkpoint, blocks by root/slot, fork-choice tree + D3.js UI, runtime aggregator toggle), the metrics/debug endpoints (Prometheus `/metrics`, jemalloc heap profiling), the Hive test-driver endpoints, plus request/response shapes, status codes, and content types.
 
 ## Configuration Files
 
@@ -327,22 +310,28 @@ GENESIS_VALIDATORS:
 ### Test Categories
 1. **Unit tests**: Embedded in source files
 2. **Spec tests**: From `leanSpec/fixtures/consensus/`
-   - `forkchoice_spectests.rs` (uses `on_block_without_verification`)
-   - `signature_spectests.rs`
-   - `stf_spectests.rs` (state transition)
+   - `crates/blockchain/tests/forkchoice_spectests.rs` (uses `on_block_without_verification` via `spec_test_runner`)
+   - `crates/blockchain/tests/signature_spectests.rs`
+   - `crates/blockchain/state_transition/tests/stf_spectests.rs` (state transition)
 
 ### Running Tests
 ```bash
-cargo test --workspace --release                                    # All workspace tests
+cargo test --workspace --profile release-fast                       # All workspace tests
 cargo test -p ethlambda-blockchain --test forkchoice_spectests
 cargo test -p ethlambda-blockchain --test forkchoice_spectests -- --test-threads=1  # Sequential
 ```
+
+Tests run under `release-fast`: release-grade opt-level (needed to avoid stack
+overflows in signature verification/aggregation) but no LTO, parallel codegen,
+incremental, and line-tables-only debuginfo, so rebuilds are much faster than
+`--release`. Artifacts land in `target/release-fast/`, separate from
+`cargo build --release`.
 
 ## Common Gotchas
 
 ### Aggregator Flag Required for Finalization
 - At least one node **must** be started with `--is-aggregator` to finalize blocks
-- Without this flag, attestations pass signature verification and are logged as "Attestation processed", but the signature is never stored for aggregation (`store.rs:368`), so blocks are always built with `attestation_count=0`
+- Without this flag, attestations pass signature verification and are logged as "Attestation processed", but the signature is never stored for aggregation (the `is_aggregator` gate in `on_gossip_attestation`, `store.rs`), so blocks are always built with `attestation_count=0`
 - The attestation pipeline: gossip → verify signature → store gossip signature (only if `is_aggregator`) → aggregate at interval 2 → promote to known → pack into blocks
 - **Symptom**: `justified_slot=0` and `finalized_slot=0` indefinitely despite healthy block production and attestation gossip
 
@@ -362,27 +351,39 @@ cargo test -p ethlambda-blockchain --test forkchoice_spectests -- --test-threads
 - Blocks are split into three tables: `BlockHeaders`, `BlockBodies`, `BlockSignatures`
 - Genesis/anchor blocks have empty bodies (detected via `EMPTY_BODY_ROOT`) — no entry in `BlockBodies`
 - Genesis block has no signatures — no entry in `BlockSignatures`
-- All other blocks must have entries in all three tables
+- Non-genesis blocks have a `BlockSignatures` entry until finalized: once below the
+  finalized boundary, signatures are pruned (`prune_old_block_signatures`) while
+  headers and bodies are kept forever. `get_signed_block` returns `None` for a
+  pruned finalized block
+- States are stored as parent-linked diffs (`StateDiffs`, never pruned) plus
+  full-state snapshots (`States`) written only at 1024-slot anchors (and the
+  bootstrap). Neither is ever pruned. `get_state` returns an anchor snapshot or
+  reconstructs by walking diffs back to the nearest anchor; results are memoized
+  in an in-memory LRU (`STATE_CACHE_CAPACITY`) so recent reads stay hot
 - `LiveChain` table provides fast `(slot||root) → parent_root` index for fork choice
 - Storage uses trait-based API: `StorageBackend` → `StorageReadView` (reads) + `StorageWriteBatch` (atomic writes)
 
-### Storage Tables (10)
+### Storage Tables (7)
+
+These are the variants of the `Table` enum (`crates/storage/src/api/tables.rs`).
 
 | Table | Key → Value | Purpose |
 |-------|-------------|---------|
 | `BlockHeaders` | H256 → BlockHeader | Block headers by root |
 | `BlockBodies` | H256 → BlockBody | Block bodies (empty for genesis) |
-| `BlockSignatures` | H256 → BlockSignatures | Signatures (absent for genesis) |
-| `States` | H256 → State | Beacon states by root |
-| `LatestKnownAttestations` | u64 → AttestationData | Fork-choice-active attestations |
-| `LatestNewAttestations` | u64 → AttestationData | Pending (pre-promotion) attestations |
-| `GossipSignatures` | SignatureKey → ValidatorSignature | Individual validator signatures |
-| `AggregatedPayloads` | SignatureKey → Vec\<AggregatedSignatureProof\> | Aggregated proofs |
+| `BlockSignatures` | (slot\|\|root) → BlockSignatures | Type-2 proof blob; keyed slot\|\|root so pruning scans in slot order and stops early; absent for genesis, pruned below finalized |
+| `States` | H256 → State | Full-state snapshots; bootstrap + 1024-slot anchors only; never pruned |
+| `StateDiffs` | H256 → StateDiff | Parent-linked state diff per non-genesis state; never pruned |
 | `Metadata` | string → various | Store state (head, config, checkpoints) |
 | `LiveChain` | (slot\|\|root) → parent\_root | Fast fork choice traversal index |
 
+Attestations and gossip signatures are **not** persisted tables; they live in
+in-memory `Store` buffers (`new_payloads`, `known_payloads`, `gossip_signatures`)
+and are consumed during the tick pipeline (promotion at intervals 0/4,
+aggregation at interval 2).
+
 ### State Root Computation
-- Always computed via `tree_hash_root()` after full state transition
+- Always computed via `hash_tree_root()` after full state transition
 - Must match proposer's pre-computed `block.state_root`
 
 ### Finalization Checks
@@ -397,8 +398,8 @@ cargo test -p ethlambda-blockchain --test forkchoice_spectests -- --test-threads
 
 **Critical:**
 - `leansig`: XMSS signatures (leanEthereum project)
-- `ethereum_ssz`: SSZ serialization
-- `tree_hash`: Merkle tree hashing
+- `libssz` / `libssz-derive` / `libssz-types`: SSZ serialization
+- `libssz-merkle`: Merkle tree hashing (`hash_tree_root()`)
 - `spawned-concurrency`: Actor model
 - `libp2p`: P2P networking (custom LambdaClass fork)
 - `vergen-git2`: Build-time git commit/branch info embedded in binary
@@ -411,6 +412,7 @@ cargo test -p ethlambda-blockchain --test forkchoice_spectests -- --test-threads
 
 **Specs:** `leanSpec/src/lean_spec/` (Python reference implementation)
 **Devnet:** `lean-quickstart` (github.com/blockblaz/lean-quickstart)
+**Docs:** `docs/` — `rpc.md`, `metrics.md`, `checkpoint_sync.md`, `3sf_mini.md`, `lmd_ghost.md` (mdbook via `make docs`)
 **Releases:** See `RELEASE.md` for release process documentation
 
 ## Other implementations

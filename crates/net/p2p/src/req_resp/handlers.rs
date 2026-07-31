@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use ethlambda_storage::Store;
 use libp2p::{PeerId, request_response};
@@ -171,6 +171,14 @@ async fn handle_status_response(server: &mut P2PServer, status: Status, peer: Pe
         return;
     }
     let gap = status.head.slot - our_head_slot;
+    warn!(
+        %peer,
+        peer_head_slot = status.head.slot,
+        local_head_slot = our_head_slot,
+        slot_gap = gap,
+        "Peer status head is ahead of local head"
+    );
+
     let start_slot = our_head_slot.saturating_add(1);
     let end_exclusive = start_slot.saturating_add(gap.min(MAX_SYNC_RANGE));
 
@@ -200,7 +208,7 @@ async fn handle_blocks_by_root_request(
 
     let mut blocks = Vec::new();
     for root in request.roots.iter() {
-        if let Some(signed_block) = server.store.get_signed_block(root) {
+        if let Ok(Some(signed_block)) = server.store.get_signed_block(root) {
             blocks.push(signed_block);
         }
         // Missing blocks are silently skipped (per spec)
@@ -261,31 +269,17 @@ fn canonical_blocks_by_range(store: &Store, start_slot: u64, count: u64) -> Vec<
         return Vec::new();
     };
 
-    let mut roots_by_slot = HashMap::new();
-    let mut current_root = store.head();
-
-    while !current_root.is_zero() {
-        let Some(header) = store.get_block_header(&current_root) else {
-            break;
-        };
-
-        if header.slot < start_slot {
-            break;
-        }
-
-        if header.slot <= end_slot {
-            roots_by_slot.insert(header.slot, current_root);
-        }
-
-        current_root = header.parent_root;
-    }
-
-    (start_slot..=end_slot)
-        .filter_map(|slot| {
-            let root = roots_by_slot.get(&slot)?;
-            store.get_signed_block(root)
+    store
+        .get_signed_blocks_by_slot_range(start_slot, end_slot)
+        .inspect_err(|err| {
+            warn!(
+                start_slot,
+                end_slot,
+                ?err,
+                "Failed to get signed blocks by slot range"
+            )
         })
-        .collect()
+        .unwrap_or_default()
 }
 
 async fn handle_blocks_by_root_response(
@@ -385,11 +379,12 @@ async fn handle_blocks_by_range_response(
 
 /// Build a Status message from the current Store state.
 pub fn build_status(store: &Store) -> Status {
-    let finalized = store.latest_finalized();
-    let head_root = store.head();
+    let finalized = store.latest_finalized().expect("finalized block exists");
+    let head_root = store.head().expect("head block exists");
     let head_slot = store
         .get_block_header(&head_root)
         .expect("head block exists")
+        .unwrap()
         .slot;
     Status {
         finalized,
@@ -617,22 +612,32 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::from_anchor_state(backend, State::from_genesis(0, vec![]));
 
-        let block_1 = signed_block(1, store.head());
+        let block_1 = signed_block(1, store.head().expect("head block exists"));
         let root_1 = block_1.message.hash_tree_root();
-        store.insert_signed_block(root_1, block_1);
+        store
+            .insert_signed_block(root_1, block_1)
+            .expect("insert test block should succeed");
 
         let block_2 = signed_block(2, root_1);
         let root_2 = block_2.message.hash_tree_root();
-        store.insert_signed_block(root_2, block_2);
+        store
+            .insert_signed_block(root_2, block_2)
+            .expect("insert test block should succeed");
 
         let side_block_3 = signed_block(3, root_1);
         let side_root_3 = side_block_3.message.hash_tree_root();
-        store.insert_signed_block(side_root_3, side_block_3);
+        store
+            .insert_signed_block(side_root_3, side_block_3)
+            .expect("insert test block should succeed");
 
         let block_4 = signed_block(4, root_2);
         let root_4 = block_4.message.hash_tree_root();
-        store.insert_signed_block(root_4, block_4);
-        store.update_checkpoints(ForkCheckpoints::head_only(root_4));
+        store
+            .insert_signed_block(root_4, block_4)
+            .expect("insert test block should succeed");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(root_4))
+            .expect("update_checkpoints should succeed");
 
         let blocks = canonical_blocks_by_range(&store, 1, 4);
         let slots: Vec<_> = blocks.iter().map(|block| block.message.slot).collect();
