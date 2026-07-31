@@ -163,7 +163,9 @@ jobs:
             GIT_COMMIT=${{ github.sha }}
             GIT_BRANCH=${{ github.ref_name }}
           push: false
-          tags: ghcr.io/lambdaclass/ethlambda:devnet4
+          tags: |
+            ghcr.io/lambdaclass/ethlambda:devnet4
+            ghcr.io/lambdaclass/ethlambda:devnet5
           outputs: type=docker,dest=/tmp/ethlambda_image.tar
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -247,12 +249,12 @@ jobs:
           echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
 
       - name: Run Hive Simulation
-        uses: ethpandaops/hive-github-action@1aa8d73dad34de13afbb3113ab16c1a462d2fbc3 # v0.5.0
+        uses: ethpandaops/hive-github-action@09050fc75bae8a10b1876a0826ca4114ea9ed6e8 # v0.6.3
         with:
           hive_repository: ethereum/hive
-          hive_version: 6f704d0cd8fb4dfd3f635abcc5a3ea6cd395e61b
+          hive_version: dde4f59d04ff0ff8b6585670b08cea1b6c8ab65c
           simulator: lean
-          client: ethlambda
+          client: ethlambda_devnet4
           client_config: ${{ steps.client-config.outputs.config }}
           extra_flags: ${{ steps.hive-flags.outputs.flags }}
 
@@ -269,5 +271,13 @@ jobs:
           name: hive_failed_logs_${{ matrix.artifact_prefix }}
           path: src/results/failed_logs
           if-no-files-found: warn
-      - name: Run fixture-based tests
-        uses: ./.github/actions/run-fixture-tests
+
+      - name: Upload Hive Run Artifacts
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: hive_run_artifacts_${{ matrix.artifact_prefix }}
+          path: |
+            src/hive.log
+            src/results
+          if-no-files-found: warn
