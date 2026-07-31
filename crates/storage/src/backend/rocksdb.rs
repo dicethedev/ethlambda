@@ -10,6 +10,8 @@ use rocksdb::{
 use std::path::Path;
 use std::sync::Arc;
 
+const LEGACY_BLOCK_SIGNATURES_CF: &str = "block_signatures";
+
 /// Returns the column family name for a table.
 ///
 /// Delegates to [`Table::name`] so the CF name and the metrics label share a
@@ -27,6 +29,7 @@ pub struct RocksDBBackend {
 impl RocksDBBackend {
     /// Open a RocksDB database at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let path = path.as_ref();
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
@@ -47,7 +50,7 @@ impl RocksDBBackend {
         let mut block_opts = BlockBasedOptions::default();
         block_opts.set_block_cache(&block_cache);
 
-        let cf_descriptors: Vec<_> = ALL_TABLES
+        let mut cf_descriptors: Vec<_> = ALL_TABLES
             .iter()
             .map(|t| {
                 let mut cf_opts = Options::default();
@@ -55,6 +58,18 @@ impl RocksDBBackend {
                 ColumnFamilyDescriptor::new(cf_name(*t), cf_opts)
             })
             .collect();
+
+        if path.exists()
+            && DBWithThreadMode::<MultiThreaded>::list_cf(&opts, path)
+                .is_ok_and(|cfs| cfs.iter().any(|cf| cf == LEGACY_BLOCK_SIGNATURES_CF))
+        {
+            let mut cf_opts = Options::default();
+            cf_opts.set_block_based_table_factory(&block_opts);
+            cf_descriptors.push(ColumnFamilyDescriptor::new(
+                LEGACY_BLOCK_SIGNATURES_CF,
+                cf_opts,
+            ));
+        }
 
         let db =
             DBWithThreadMode::<MultiThreaded>::open_cf_descriptors(&opts, path, cf_descriptors)?;

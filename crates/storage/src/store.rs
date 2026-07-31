@@ -105,11 +105,11 @@ const SNAPSHOT_ANCHOR_INTERVAL: u64 = 1_024;
 /// snapshot read or a diff-chain reconstruction.
 const STATE_CACHE_CAPACITY: usize = 32;
 
-/// Keep block signatures for at least this many slots below the tip, even once
-/// finalized. Signatures older than this window are pruned only when the window
-/// lies entirely within finalized history; see [`Store::prune_old_block_signatures`].
+/// Keep block proofs for at least this many slots below the tip, even once
+/// finalized. Proofs older than this window are pruned only when the window
+/// lies entirely within finalized history; see [`Store::prune_old_block_proofs`].
 /// ~1 day at 4-second slots.
-const SIGNATURE_PRUNING_RANGE: u64 = 21_600;
+const BLOCK_PROOF_PRUNING_RANGE: u64 = 21_600;
 
 /// ~30 minutes of resume window at 4-second slots (1800 / 4 = 450).
 pub const MAX_RESUMABLE_DB_STATE_AGE: u64 = 450;
@@ -521,7 +521,7 @@ fn encode_slot_root_key(slot: u64, root: &H256) -> Vec<u8> {
     result
 }
 
-/// Decode a slot||root key (LiveChain / BlockSignatures) from bytes.
+/// Decode a slot||root key (LiveChain / BlockProof) from bytes.
 fn decode_slot_root_key(bytes: &[u8]) -> (u64, H256) {
     let slot = u64::from_be_bytes(bytes[..8].try_into().expect("valid slot bytes"));
     let root = H256::from_slice(&bytes[8..]);
@@ -891,10 +891,10 @@ impl Store {
         Ok(())
     }
 
-    /// Prune finalized block signatures to keep signature storage bounded.
+    /// Prune finalized block proofs to keep proof storage bounded.
     ///
     /// State diffs, block headers, block bodies, and full-state snapshots are
-    /// all retained for the full history and are never pruned. Only signatures
+    /// all retained for the full history and are never pruned. Only proofs
     /// of finalized blocks older than the pruning window are removed.
     ///
     /// This is separated from `update_checkpoints` so callers can defer heavy
@@ -909,11 +909,11 @@ impl Store {
             .map_or(finalized_slot, |header| {
                 header.expect("Failed to get block header").slot
             });
-        let pruned_signatures = self
-            .prune_old_block_signatures(finalized_slot, tip_slot)
-            .expect("prune old block signatures");
-        if pruned_signatures > 0 {
-            info!(pruned_signatures, "Pruned old finalized block signatures");
+        let pruned_proofs = self
+            .prune_old_block_proofs(finalized_slot, tip_slot)
+            .expect("prune old block proofs");
+        if pruned_proofs > 0 {
+            info!(pruned_proofs, "Pruned old finalized block proofs");
         }
         Ok(())
     }
@@ -1063,30 +1063,30 @@ impl Store {
         pruned_new + pruned_known
     }
 
-    /// Prune signatures of old finalized blocks, keeping a recent window.
+    /// Prune proofs of old finalized blocks, keeping a recent window.
     ///
-    /// Signatures within [`SIGNATURE_PRUNING_RANGE`] slots of `tip_slot` are
-    /// always kept, as are all signatures of non-finalized blocks. Concretely,
-    /// with `cutoff = tip_slot - SIGNATURE_PRUNING_RANGE`:
+    /// Proofs within [`BLOCK_PROOF_PRUNING_RANGE`] slots of `tip_slot` are
+    /// always kept, as are all proofs of non-finalized blocks. Concretely,
+    /// with `cutoff = tip_slot - BLOCK_PROOF_PRUNING_RANGE`:
     ///
-    /// - if `cutoff <= finalized_slot` (healthy finality): delete signatures for
+    /// - if `cutoff <= finalized_slot` (healthy finality): delete proofs for
     ///   `slot < cutoff` (entirely within finalized history);
     /// - otherwise (the non-finalized range exceeds the window): prune nothing,
     ///   since pruning up to `cutoff` would touch non-finalized blocks.
     ///
     /// Headers and bodies are always retained. Finalized blocks can never be
-    /// reverted, so their signatures are not needed for fork choice, re-org
+    /// reverted, so their proofs are not needed for fork choice, re-org
     /// safety, or re-aggregation once outside the window.
     ///
-    /// Returns the number of signatures pruned.
-    pub fn prune_old_block_signatures(
+    /// Returns the number of proofs pruned.
+    pub fn prune_old_block_proofs(
         &mut self,
         finalized_slot: u64,
         tip_slot: u64,
     ) -> Result<usize, Error> {
-        let cutoff = tip_slot.saturating_sub(SIGNATURE_PRUNING_RANGE);
+        let cutoff = tip_slot.saturating_sub(BLOCK_PROOF_PRUNING_RANGE);
         // Only prune when the whole window is finalized; never touch
-        // non-finalized signatures.
+        // non-finalized proofs.
         if cutoff > finalized_slot {
             return Ok(0);
         }
@@ -1096,7 +1096,7 @@ impl Store {
         // Keys are slot||root in big-endian slot order, so iteration ascends by
         // slot: take entries below the cutoff and stop at the first one past it.
         let keys_to_delete: Vec<Vec<u8>> = view
-            .prefix_iterator(Table::BlockSignatures, &[])
+            .prefix_iterator(Table::BlockProof, &[])
             .expect("iterator")
             .filter_map(|res| res.ok())
             .map(|(key, _)| key.to_vec())
@@ -1108,8 +1108,8 @@ impl Store {
         if count > 0 {
             let mut batch = self.backend.begin_write().expect("write batch");
             batch
-                .delete_batch(Table::BlockSignatures, keys_to_delete)
-                .expect("delete finalized block signatures");
+                .delete_batch(Table::BlockProof, keys_to_delete)
+                .expect("delete finalized block proofs");
             batch.commit().expect("commit");
         }
         Ok(count)
@@ -1128,8 +1128,8 @@ impl Store {
 
     /// Insert a block as pending (parent state not yet available).
     ///
-    /// Stores block data in `BlockHeaders`/`BlockBodies`/`BlockSignatures`
-    /// **without** writing to `LiveChain`. This persists the heavy signature
+    /// Stores block data in `BlockHeaders`/`BlockBodies`/`BlockProof`
+    /// **without** writing to `LiveChain`. This persists the heavy proof
     /// data (~3KB+ per block) to disk while keeping the block invisible to
     /// fork choice.
     ///
@@ -1201,15 +1201,15 @@ impl Store {
     /// Get a signed block by combining header, body, and the merged proof.
     ///
     /// Returns None if the header or body (for non-empty bodies) is missing,
-    /// or if the signature row is missing for any block other than the
+    /// or if the proof row is missing for any block other than the
     /// slot-0 anchor.
     ///
-    /// Signatures are absent in two cases: genesis-style anchor blocks (no
-    /// proposer ever signed them), and finalized blocks whose signatures were
-    /// pruned by [`prune_old_block_signatures`](Self::prune_old_block_signatures).
+    /// Proofs are absent in two cases: genesis-style anchor blocks (no
+    /// proposer ever signed them), and finalized blocks whose proofs were
+    /// pruned by [`prune_old_block_proofs`](Self::prune_old_block_proofs).
     /// To keep BlocksByRoot symmetric with the fork-choice view for peers,
     /// synthesize an empty proof for the slot-0 anchor only; for any other slot
-    /// a missing signature surfaces as `None` (a pruned finalized block can no
+    /// a missing proof surfaces as `None` (a pruned finalized block can no
     /// longer be served with its proof) rather than as a fabricated block.
     pub fn get_signed_block(&self, root: &H256) -> Result<Option<SignedBlock>, Error> {
         let view = self.backend.begin_read().expect("read view");
@@ -1231,7 +1231,7 @@ impl Store {
         };
 
         let sig_key = encode_slot_root_key(header.slot, root);
-        let proof = match view.get(Table::BlockSignatures, &sig_key).expect("get") {
+        let proof = match view.get(Table::BlockProof, &sig_key).expect("get") {
             Some(proof_bytes) => {
                 MultiMessageAggregate::from_ssz_bytes(&proof_bytes).expect("valid block proof")
             }
@@ -1695,12 +1695,11 @@ fn write_signed_block(
             .expect("put block body");
     }
 
-    // Store the merged multi-message aggregate proof blob, keyed by slot||root so signature
-    // pruning can scan in slot order and stop early. Table name kept for the
-    // column-family migration cost; renaming to `BlockProof` is a follow-up.
+    // Store the merged multi-message aggregate proof blob, keyed by slot||root
+    // so proof pruning can scan in slot order and stop early.
     let proof_entries = vec![(encode_slot_root_key(header.slot, root), proof.to_ssz())];
     batch
-        .put_batch(Table::BlockSignatures, proof_entries)
+        .put_batch(Table::BlockProof, proof_entries)
         .expect("put block proof");
 
     block
@@ -1711,7 +1710,7 @@ mod tests {
     use super::*;
     use crate::backend::InMemoryBackend;
 
-    /// Insert a block header (and dummy body + signature) for a given root, slot,
+    /// Insert a block header (and dummy body + proof) for a given root, slot,
     /// and parent. The stored header equals `header_at(slot, parent_root)`, so a
     /// state built from the same `(slot, parent_root)` reconstructs byte-identically.
     fn insert_header(backend: &dyn StorageBackend, root: H256, slot: u64, parent_root: H256) {
@@ -1726,10 +1725,10 @@ mod tests {
             .expect("put body");
         batch
             .put_batch(
-                Table::BlockSignatures,
+                Table::BlockProof,
                 vec![(encode_slot_root_key(slot, &root), vec![0u8; 4])],
             )
-            .expect("put sigs");
+            .expect("put proof");
         batch
             .put_batch(
                 Table::BlockRoots,
@@ -1763,10 +1762,10 @@ mod tests {
         view.get(table, &root.to_ssz()).expect("get").is_some()
     }
 
-    /// Check whether a block signature exists for a (slot, root) pair.
-    fn has_signature(backend: &dyn StorageBackend, slot: u64, root: &H256) -> bool {
+    /// Check whether a block proof exists for a (slot, root) pair.
+    fn has_block_proof(backend: &dyn StorageBackend, slot: u64, root: &H256) -> bool {
         let view = backend.begin_read().expect("read view");
-        view.get(Table::BlockSignatures, &encode_slot_root_key(slot, root))
+        view.get(Table::BlockProof, &encode_slot_root_key(slot, root))
             .expect("get")
             .is_some()
     }
@@ -1917,33 +1916,33 @@ mod tests {
     }
 
     #[test]
-    fn prune_old_blocks_within_retention() {
+    fn prune_old_block_proofs_within_retention() {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::test_store_with_backend(backend.clone());
 
-        // Blocks at slots 0..12, each with header + body + signature.
+        // Blocks at slots 0..12, each with header + body + proof.
         for i in 0..13u64 {
             insert_header(backend.as_ref(), root(i), i, H256::ZERO);
         }
 
-        // Healthy finality: non-finalized gap (5) < SIGNATURE_PRUNING_RANGE.
+        // Healthy finality: non-finalized gap (5) < BLOCK_PROOF_PRUNING_RANGE.
         // tip = range + 10, finalized = range + 5, so cutoff = tip - range = 10.
-        let tip_slot = SIGNATURE_PRUNING_RANGE + 10;
-        let finalized_slot = SIGNATURE_PRUNING_RANGE + 5;
+        let tip_slot = BLOCK_PROOF_PRUNING_RANGE + 10;
+        let finalized_slot = BLOCK_PROOF_PRUNING_RANGE + 5;
         let pruned = store
-            .prune_old_block_signatures(finalized_slot, tip_slot)
+            .prune_old_block_proofs(finalized_slot, tip_slot)
             .expect("prune");
 
         // cutoff = 10: slots 0..9 pruned, slots 10..12 kept (within the window).
         assert_eq!(pruned, 10);
-        assert_eq!(count_entries(backend.as_ref(), Table::BlockSignatures), 3);
+        assert_eq!(count_entries(backend.as_ref(), Table::BlockProof), 3);
 
-        // Oldest signatures are gone, but headers, bodies, and roots stay queryable.
+        // Oldest proofs are gone, but headers, bodies, and roots stay queryable.
         for i in 0..10u64 {
-            assert!(!has_signature(backend.as_ref(), i, &root(i)));
+            assert!(!has_block_proof(backend.as_ref(), i, &root(i)));
         }
         for i in 10..13u64 {
-            assert!(has_signature(backend.as_ref(), i, &root(i)));
+            assert!(has_block_proof(backend.as_ref(), i, &root(i)));
         }
 
         // Headers and bodies are always retained for the whole history.
@@ -1953,7 +1952,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_signatures_noop_when_non_finalized_range_exceeds_window() {
+    fn prune_block_proofs_noop_when_non_finalized_range_exceeds_window() {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::test_store_with_backend(backend.clone());
 
@@ -1961,19 +1960,19 @@ mod tests {
             insert_header(backend.as_ref(), root(i), i, H256::ZERO);
         }
 
-        // Deep non-finality: gap (tip - finalized) > SIGNATURE_PRUNING_RANGE, so
+        // Deep non-finality: gap (tip - finalized) > BLOCK_PROOF_PRUNING_RANGE, so
         // cutoff = tip - range > finalized → prune nothing.
-        let tip_slot = SIGNATURE_PRUNING_RANGE + 100;
+        let tip_slot = BLOCK_PROOF_PRUNING_RANGE + 100;
         let finalized_slot = 5;
         let pruned = store
-            .prune_old_block_signatures(finalized_slot, tip_slot)
+            .prune_old_block_proofs(finalized_slot, tip_slot)
             .expect("prune");
         assert_eq!(pruned, 0);
-        assert_eq!(count_entries(backend.as_ref(), Table::BlockSignatures), 10);
+        assert_eq!(count_entries(backend.as_ref(), Table::BlockProof), 10);
     }
 
     #[test]
-    fn prune_signatures_noop_when_tip_within_window() {
+    fn prune_block_proofs_noop_when_tip_within_window() {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::test_store_with_backend(backend.clone());
 
@@ -1981,11 +1980,11 @@ mod tests {
             insert_header(backend.as_ref(), root(i), i, H256::ZERO);
         }
 
-        // Early chain: tip < SIGNATURE_PRUNING_RANGE → cutoff saturates to 0,
+        // Early chain: tip < BLOCK_PROOF_PRUNING_RANGE → cutoff saturates to 0,
         // so nothing is old enough to prune even though slots are finalized.
-        let pruned = store.prune_old_block_signatures(9, 9).expect("prune");
+        let pruned = store.prune_old_block_proofs(9, 9).expect("prune");
         assert_eq!(pruned, 0);
-        assert_eq!(count_entries(backend.as_ref(), Table::BlockSignatures), 10);
+        assert_eq!(count_entries(backend.as_ref(), Table::BlockProof), 10);
     }
 
     // ============ State Diff Reconstruction Tests ============
@@ -2873,7 +2872,7 @@ mod tests {
         assert_eq!(buf.len(), 2);
     }
 
-    /// `Store::from_anchor_state` writes the header but no `BlockSignatures`
+    /// `Store::from_anchor_state` writes the header but no `BlockProof`
     /// row for the slot-0 anchor. `get_signed_block` must synthesize an empty
     /// proof so the genesis block can still be served on BlocksByRoot /
     /// `/lean/v0/blocks/finalized`.
@@ -2893,14 +2892,14 @@ mod tests {
     }
 
     /// The synthesis branch must be confined to the slot-0 anchor: a
-    /// non-genesis block whose `BlockSignatures` row is missing is treated
+    /// non-genesis block whose `BlockProof` row is missing is treated
     /// as storage corruption and surfaces as `None`, not a fabricated block.
     #[test]
-    fn get_signed_block_returns_none_for_non_genesis_with_missing_signatures() {
+    fn get_signed_block_returns_none_for_non_genesis_with_missing_proof() {
         let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
 
         // Hand-insert a slot-1 header (and empty body, via `EMPTY_BODY_ROOT`)
-        // but skip the `BlockSignatures` row. This mimics the corruption case
+        // but skip the `BlockProof` row. This mimics the corruption case
         // the guard is meant to catch, without going through the normal
         // `insert_signed_block` write path which always writes all three rows.
         let header = BlockHeader {
