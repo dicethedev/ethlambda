@@ -939,11 +939,6 @@ impl Store {
             .expect("prune old block proofs");
         if pruned_proofs > 0 {
             info!(pruned_proofs, "Pruned old finalized block proofs");
-        let pruned_below_slot = self
-            .prune_old_block_signatures(finalized_slot, tip_slot)
-            .expect("prune old block signatures");
-        if pruned_below_slot > 0 {
-            info!(pruned_below_slot, "Pruned old finalized block signatures");
         }
         Ok(())
     }
@@ -1143,37 +1138,6 @@ impl Store {
             batch.commit().expect("commit");
         }
         Ok(count)
-    /// Returns the exclusive slot below which signatures were dropped, or 0 when
-    /// nothing was pruned. This is a range delete, so the count of removed keys
-    /// is not known without reading the table back.
-    pub fn prune_old_block_signatures(
-        &mut self,
-        finalized_slot: u64,
-        tip_slot: u64,
-    ) -> Result<u64, Error> {
-        let cutoff = tip_slot.saturating_sub(SIGNATURE_PRUNING_RANGE);
-        // Only prune when the whole window is finalized; never touch
-        // non-finalized signatures. A zero cutoff covers nothing.
-        if cutoff > finalized_slot || cutoff == 0 {
-            return Ok(0);
-        }
-
-        // Keys are slot||root in big-endian slot order, so the cutoff's bare
-        // slot prefix is an exact upper bound: keys below the cutoff sort
-        // before it, and keys at the cutoff sort after it (they extend it with
-        // a root). A single range delete drops them all without reading the
-        // table (and without walking the tombstones left by earlier prunes).
-        let mut batch = self.backend.begin_write().expect("write batch");
-        batch
-            .delete_range(
-                Table::BlockSignatures,
-                &0u64.to_be_bytes(),
-                &cutoff.to_be_bytes(),
-            )
-            .expect("delete finalized block signatures");
-        batch.commit().expect("commit");
-
-        Ok(cutoff)
     }
 
     /// Get the block header by root.
@@ -2023,15 +1987,6 @@ mod tests {
         // cutoff = 10: slots 0..9 pruned, slots 10..12 kept (within the window).
         assert_eq!(pruned, 10);
         assert_eq!(count_entries(backend.as_ref(), Table::BlockProof), 3);
-        let tip_slot = SIGNATURE_PRUNING_RANGE + 10;
-        let finalized_slot = SIGNATURE_PRUNING_RANGE + 5;
-        let pruned_below_slot = store
-            .prune_old_block_signatures(finalized_slot, tip_slot)
-            .expect("prune");
-
-        // cutoff = 10: slots 0..9 pruned, slots 10..12 kept (within the window).
-        assert_eq!(pruned_below_slot, 10);
-        assert_eq!(count_entries(backend.as_ref(), Table::BlockSignatures), 3);
 
         // Oldest proofs are gone, but headers, bodies, and roots stay queryable.
         for i in 0..10u64 {
@@ -2065,11 +2020,6 @@ mod tests {
             .expect("prune");
         assert_eq!(pruned, 0);
         assert_eq!(count_entries(backend.as_ref(), Table::BlockProof), 10);
-        let pruned_below_slot = store
-            .prune_old_block_signatures(finalized_slot, tip_slot)
-            .expect("prune");
-        assert_eq!(pruned_below_slot, 0);
-        assert_eq!(count_entries(backend.as_ref(), Table::BlockSignatures), 10);
     }
 
     #[test]
@@ -2086,9 +2036,6 @@ mod tests {
         let pruned = store.prune_old_block_proofs(9, 9).expect("prune");
         assert_eq!(pruned, 0);
         assert_eq!(count_entries(backend.as_ref(), Table::BlockProof), 10);
-        let pruned_below_slot = store.prune_old_block_signatures(9, 9).expect("prune");
-        assert_eq!(pruned_below_slot, 0);
-        assert_eq!(count_entries(backend.as_ref(), Table::BlockSignatures), 10);
     }
 
     // ============ State Diff Reconstruction Tests ============
