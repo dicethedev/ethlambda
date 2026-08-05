@@ -156,9 +156,8 @@ anchors, whose bodies are either empty or unavailable. Never pruned.
 ### BlockProof
 
 `slot ‖ root → MultiMessageAggregate`. This table stores the block's **merged
-aggregate proof blob**, not individual signatures. It is keyed by `slot ‖ root`
-(not plain root) precisely so that pruning can scan in slot order and stop
-early.
+aggregate proof blob**. It is keyed by `slot ‖ root` so that pruning can scan in
+slot order and stop early.
 
 Stored separately from headers/bodies because the genesis block has no proof.
 `get_signed_block` synthesizes an empty proof for the slot-0 anchor only; for
