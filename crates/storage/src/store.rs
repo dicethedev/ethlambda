@@ -307,6 +307,7 @@ impl PayloadBuffer {
     /// broken toward the larger canonical attestation-data root — the same rule the
     /// block-level fork-choice tiebreak applies to block roots (leanSpec #1181). The
     /// pool key is already `hash_tree_root(data)`, so the tie needs no extra hashing.
+    #[cfg(test)]
     fn extract_latest_attestations(&self) -> HashMap<u64, AttestationData> {
         let mut ordered: Vec<(&H256, &PayloadEntry)> = self.data.iter().collect();
         // Descending by (slot, data_root): the larger tuple is the canonical winner.
@@ -342,7 +343,13 @@ pub type GossipSignatureSnapshot = Vec<(HashedAttestationData, Vec<(u64, Validat
 type StorageKey = Vec<u8>;
 type StorageEntry = (StorageKey, Vec<u8>);
 type BlockRootIndexChanges = (Vec<StorageKey>, Vec<StorageEntry>);
-type VoteStore = Vec<Option<AttestationData>>;
+type VoteStore = HashMap<u64, AttestationData>;
+
+#[derive(Clone, Default)]
+struct ForkChoiceState {
+    known_votes: VoteStore,
+    new_votes: VoteStore,
+}
 
 /// Bounded buffer for gossip signatures with FIFO eviction.
 ///
@@ -557,8 +564,8 @@ pub struct Store {
     backend: Arc<dyn StorageBackend>,
     new_payloads: Arc<Mutex<PayloadBuffer>>,
     known_payloads: Arc<Mutex<PayloadBuffer>>,
-    /// Latest fork-choice vote per validator, independent from bounded proof buffers.
-    votes: Arc<Mutex<VoteStore>>,
+    /// Fork-choice votes, independent from bounded proof/signature buffers.
+    fork_choice: Arc<Mutex<ForkChoiceState>>,
     /// In-memory gossip signatures, consumed at interval 2 aggregation.
     gossip_signatures: Arc<Mutex<GossipSignatureBuffer>>,
     /// LRU memoization of states by block root, shared across `Store` clones.
@@ -570,10 +577,6 @@ pub struct Store {
 fn new_state_cache() -> Arc<Mutex<LruCache<H256, State>>> {
     let capacity = NonZeroUsize::new(STATE_CACHE_CAPACITY).expect("cache capacity is non-zero");
     Arc::new(Mutex::new(LruCache::new(capacity)))
-}
-
-fn new_vote_store() -> Arc<Mutex<VoteStore>> {
-    Arc::new(Mutex::new(Vec::new()))
 }
 
 impl Store {
@@ -648,7 +651,7 @@ impl Store {
             backend,
             new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
             known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
-            votes: new_vote_store(),
+            fork_choice: Default::default(),
             gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                 GOSSIP_SIGNATURE_CAP,
             ))),
@@ -761,7 +764,7 @@ impl Store {
             backend,
             new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
             known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
-            votes: new_vote_store(),
+            fork_choice: Default::default(),
             gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                 GOSSIP_SIGNATURE_CAP,
             ))),
@@ -892,16 +895,11 @@ impl Store {
             let pruned_sigs = self.prune_gossip_signatures(finalized.slot);
 
             let pruned_payloads = self.prune_stale_aggregated_payloads(finalized.slot);
-            let pruned_votes = self.prune_known_votes(finalized.slot);
 
-            if pruned_chain > 0 || pruned_sigs > 0 || pruned_payloads > 0 || pruned_votes > 0 {
+            if pruned_chain > 0 || pruned_sigs > 0 || pruned_payloads > 0 {
                 info!(
                     finalized_slot = finalized.slot,
-                    pruned_chain,
-                    pruned_sigs,
-                    pruned_payloads,
-                    pruned_votes,
-                    "Pruned finalized data"
+                    pruned_chain, pruned_sigs, pruned_payloads, "Pruned finalized data"
                 );
             }
         }
@@ -1080,22 +1078,6 @@ impl Store {
         pruned_new + pruned_known
     }
 
-    /// Prune latest fork-choice votes whose target is at or below `finalized_slot`.
-    pub fn prune_known_votes(&mut self, finalized_slot: u64) -> usize {
-        let mut votes = self.votes.lock().unwrap();
-        let mut pruned = 0;
-        for vote in votes.iter_mut() {
-            let should_prune = vote
-                .as_ref()
-                .is_some_and(|data| data.target.slot <= finalized_slot);
-            if should_prune {
-                *vote = None;
-                pruned += 1;
-            }
-        }
-        pruned
-    }
-
     /// Prune signatures of old finalized blocks, keeping a recent window.
     ///
     /// Signatures within [`SIGNATURE_PRUNING_RANGE`] slots of `tip_slot` are
@@ -1203,6 +1185,7 @@ impl Store {
             .expect("put non-finalized chain index");
 
         batch.commit().expect("commit");
+        self.record_known_attestation_votes(&block.body.attestations);
         Ok(())
     }
 
@@ -1458,16 +1441,20 @@ impl Store {
     }
 
     fn record_vote(votes: &mut VoteStore, validator_id: u64, data: &AttestationData) {
-        let index = validator_id as usize;
-        if votes.len() <= index {
-            votes.resize_with(index + 1, || None);
-        }
-
-        let should_replace = votes[index]
-            .as_ref()
+        let should_replace = votes
+            .get(&validator_id)
             .is_none_or(|existing| Self::should_replace_vote(existing, data));
         if should_replace {
-            votes[index] = Some(data.clone());
+            votes.insert(validator_id, data.clone());
+        }
+    }
+
+    fn record_votes<I>(votes: &mut VoteStore, data: &AttestationData, validator_ids: I)
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        for validator_id in validator_ids {
+            Self::record_vote(votes, validator_id, data);
         }
     }
 
@@ -1475,29 +1462,37 @@ impl Store {
     where
         I: IntoIterator<Item = u64>,
     {
-        let mut votes = self.votes.lock().unwrap();
-        for validator_id in validator_ids {
-            Self::record_vote(&mut votes, validator_id, data);
+        let mut fork_choice = self.fork_choice.lock().unwrap();
+        Self::record_votes(&mut fork_choice.known_votes, data, validator_ids);
+    }
+
+    fn record_new_votes<I>(&self, data: &AttestationData, validator_ids: I)
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        let mut fork_choice = self.fork_choice.lock().unwrap();
+        Self::record_votes(&mut fork_choice.new_votes, data, validator_ids);
+    }
+
+    fn record_known_attestation_votes(&self, attestations: &[AggregatedAttestation]) {
+        let mut fork_choice = self.fork_choice.lock().unwrap();
+        for attestation in attestations {
+            Self::record_votes(
+                &mut fork_choice.known_votes,
+                &attestation.data,
+                validator_indices(&attestation.aggregation_bits),
+            );
         }
     }
 
     /// Extract per-validator latest attestations from known fork-choice votes.
     pub fn extract_latest_known_attestations(&self) -> HashMap<u64, AttestationData> {
-        self.votes
-            .lock()
-            .unwrap()
-            .iter()
-            .enumerate()
-            .filter_map(|(validator_id, vote)| vote.clone().map(|data| (validator_id as u64, data)))
-            .collect()
+        self.fork_choice.lock().unwrap().known_votes.clone()
     }
 
     /// Extract per-validator latest attestations from new (pending) payloads.
     pub fn extract_latest_new_attestations(&self) -> HashMap<u64, AttestationData> {
-        self.new_payloads
-            .lock()
-            .unwrap()
-            .extract_latest_attestations()
+        self.fork_choice.lock().unwrap().new_votes.clone()
     }
 
     /// Extract per-validator latest attestations from the raw gossip signature
@@ -1511,16 +1506,6 @@ impl Store {
             .lock()
             .unwrap()
             .extract_latest_attestations()
-    }
-
-    /// Insert proof-less fork-choice votes from block-included attestations.
-    pub fn insert_known_attestation_votes(&mut self, attestations: &[AggregatedAttestation]) {
-        for attestation in attestations {
-            self.record_known_votes(
-                &attestation.data,
-                validator_indices(&attestation.aggregation_bits),
-            );
-        }
     }
 
     // ============ Known Aggregated Payloads ============
@@ -1584,16 +1569,6 @@ impl Store {
         self.new_payloads.lock().unwrap().attestation_data_keys()
     }
 
-    /// Insert a single proof into the known (fork-choice-active) buffer.
-    pub fn insert_known_aggregated_payload(
-        &mut self,
-        hashed: HashedAttestationData,
-        proof: SingleMessageAggregate,
-    ) {
-        self.record_known_votes(hashed.data(), proof.participant_indices());
-        self.known_payloads.lock().unwrap().push(hashed, proof);
-    }
-
     /// Batch-insert proofs into the known buffer.
     pub fn insert_known_aggregated_payloads_batch(
         &mut self,
@@ -1616,6 +1591,7 @@ impl Store {
         hashed: HashedAttestationData,
         proof: SingleMessageAggregate,
     ) {
+        self.record_new_votes(hashed.data(), proof.participant_indices());
         self.new_payloads.lock().unwrap().push(hashed, proof);
     }
 
@@ -1624,6 +1600,9 @@ impl Store {
         &mut self,
         entries: Vec<(HashedAttestationData, SingleMessageAggregate)>,
     ) {
+        for (hashed, proof) in &entries {
+            self.record_new_votes(hashed.data(), proof.participant_indices());
+        }
         self.new_payloads.lock().unwrap().push_batch(entries);
     }
 
@@ -1634,8 +1613,12 @@ impl Store {
     /// Drains the new buffer and pushes all entries into the known buffer.
     pub fn promote_new_aggregated_payloads(&mut self) {
         let drained = self.new_payloads.lock().unwrap().drain();
-        for (hashed, proof) in &drained {
-            self.record_known_votes(hashed.data(), proof.participant_indices());
+        {
+            let mut fork_choice = self.fork_choice.lock().unwrap();
+            let new_votes = std::mem::take(&mut fork_choice.new_votes);
+            for (validator_id, data) in new_votes {
+                Self::record_vote(&mut fork_choice.known_votes, validator_id, &data);
+            }
         }
         self.known_payloads.lock().unwrap().push_batch(drained);
     }
@@ -1882,6 +1865,25 @@ mod tests {
         }
     }
 
+    fn signed_block_with_attestations(
+        slot: u64,
+        parent_root: H256,
+        attestations: Vec<AggregatedAttestation>,
+    ) -> SignedBlock {
+        SignedBlock {
+            message: Block {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: H256::ZERO,
+                body: BlockBody {
+                    attestations: attestations.try_into().unwrap(),
+                },
+            },
+            proof: MultiMessageAggregate::default(),
+        }
+    }
+
     impl Store {
         /// Create a Store with an in-memory backend for tests.
         fn test_store() -> Self {
@@ -1890,7 +1892,7 @@ mod tests {
                 backend,
                 new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
                 known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
-                votes: new_vote_store(),
+                fork_choice: Default::default(),
                 gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                     GOSSIP_SIGNATURE_CAP,
                 ))),
@@ -1905,7 +1907,7 @@ mod tests {
                 backend,
                 new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
                 known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
-                votes: new_vote_store(),
+                fork_choice: Default::default(),
                 gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                     GOSSIP_SIGNATURE_CAP,
                 ))),
@@ -1999,6 +2001,29 @@ mod tests {
             .expect("get blocks by slot range");
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].message.hash_tree_root(), block_root);
+    }
+
+    #[test]
+    fn insert_signed_block_records_block_attestation_votes() {
+        let mut store = Store::test_store();
+        let data = make_att_data_for_target(8, root(8));
+        let block = signed_block_with_attestations(
+            1,
+            H256::ZERO,
+            vec![AggregatedAttestation {
+                aggregation_bits: make_proof_for_validators(&[1, 3]).participants,
+                data: data.clone(),
+            }],
+        );
+        let block_root = block.message.hash_tree_root();
+
+        store
+            .insert_signed_block(block_root, block)
+            .expect("insert signed block");
+
+        let votes = store.extract_latest_known_attestations();
+        assert_eq!(votes[&1], data);
+        assert_eq!(votes[&3], data);
     }
 
     #[test]
@@ -2320,17 +2345,23 @@ mod tests {
             make_proof_for_validator(0),
         );
         store.insert_new_aggregated_payload(
-            HashedAttestationData::new(data),
+            HashedAttestationData::new(data.clone()),
             make_proof_for_validator(1),
         );
 
         assert_eq!(store.new_payloads.lock().unwrap().len(), 1);
         assert_eq!(store.known_payloads.lock().unwrap().len(), 0);
+        assert_eq!(store.extract_latest_new_attestations()[&0], data);
+        assert_eq!(store.extract_latest_new_attestations()[&1], data);
+        assert!(store.extract_latest_known_attestations().is_empty());
 
         store.promote_new_aggregated_payloads();
 
         assert_eq!(store.new_payloads.lock().unwrap().len(), 0);
         assert_eq!(store.known_payloads.lock().unwrap().len(), 1);
+        assert!(store.extract_latest_new_attestations().is_empty());
+        assert_eq!(store.extract_latest_known_attestations()[&0], data);
+        assert_eq!(store.extract_latest_known_attestations()[&1], data);
         // The known buffer should have 2 proofs for this data
         assert_eq!(
             store.known_payloads.lock().unwrap().data[&data_root]
@@ -2659,18 +2690,18 @@ mod tests {
             HashedAttestationData::new(stale.clone()),
             make_proof_for_validators(&[0]),
         );
-        store.insert_known_aggregated_payload(
+        store.insert_known_aggregated_payloads_batch(vec![(
             HashedAttestationData::new(stale),
             make_proof_for_validators(&[1]),
-        );
+        )]);
         store.insert_new_aggregated_payload(
             HashedAttestationData::new(fresh.clone()),
             make_proof_for_validators(&[2]),
         );
-        store.insert_known_aggregated_payload(
+        store.insert_known_aggregated_payloads_batch(vec![(
             HashedAttestationData::new(fresh),
             make_proof_for_validators(&[3]),
-        );
+        )]);
 
         assert_eq!(store.new_aggregated_payloads_count(), 2);
         assert_eq!(store.known_aggregated_payloads_count(), 2);
@@ -2688,18 +2719,18 @@ mod tests {
         let vote = make_att_data_for_target(100, root(100));
         let vote_root = vote.hash_tree_root();
 
-        store.insert_known_aggregated_payload(
+        store.insert_known_aggregated_payloads_batch(vec![(
             HashedAttestationData::new(vote.clone()),
             make_proof_for_validator(0),
-        );
+        )]);
 
         for i in 0..=AGGREGATED_PAYLOAD_CAP {
             let slot = i as u64 + 1;
             let data = make_att_data_for_target(slot, root(1_000 + slot));
-            store.insert_known_aggregated_payload(
+            store.insert_known_aggregated_payloads_batch(vec![(
                 HashedAttestationData::new(data),
                 make_proof_for_validator(1),
-            );
+            )]);
         }
 
         assert!(
@@ -2714,23 +2745,23 @@ mod tests {
     }
 
     #[test]
-    fn prune_known_votes_drops_finalized_targets() {
+    fn known_votes_survive_finalized_payload_pruning() {
         let mut store = Store::test_store();
         let stale = make_att_data_for_target(2, root(2));
         let fresh = make_att_data_for_target(10, root(10));
 
-        store.insert_known_aggregated_payload(
-            HashedAttestationData::new(stale),
+        store.insert_known_aggregated_payloads_batch(vec![(
+            HashedAttestationData::new(stale.clone()),
             make_proof_for_validator(0),
-        );
-        store.insert_known_aggregated_payload(
+        )]);
+        store.insert_known_aggregated_payloads_batch(vec![(
             HashedAttestationData::new(fresh.clone()),
             make_proof_for_validator(1),
-        );
+        )]);
 
-        assert_eq!(store.prune_known_votes(5), 1);
+        assert_eq!(store.prune_stale_aggregated_payloads(5), 1);
         let votes = store.extract_latest_known_attestations();
-        assert!(!votes.contains_key(&0));
+        assert_eq!(votes[&0], stale);
         assert_eq!(votes[&1], fresh);
     }
 
