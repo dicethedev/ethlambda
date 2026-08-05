@@ -934,11 +934,11 @@ impl Store {
             .map_or(finalized_slot, |header| {
                 header.expect("Failed to get block header").slot
             });
-        let pruned_proofs = self
+        let pruned_below_slot = self
             .prune_old_block_proofs(finalized_slot, tip_slot)
             .expect("prune old block proofs");
-        if pruned_proofs > 0 {
-            info!(pruned_proofs, "Pruned old finalized block proofs");
+        if pruned_below_slot > 0 {
+            info!(pruned_below_slot, "Pruned old finalized block proofs");
         }
         Ok(())
     }
@@ -1103,41 +1103,37 @@ impl Store {
     /// reverted, so their proofs are not needed for fork choice, re-org
     /// safety, or re-aggregation once outside the window.
     ///
-    /// Returns the number of proofs pruned.
+    /// Returns the exclusive slot below which proofs were dropped, or 0 when
+    /// nothing was pruned. This is a range delete, so the count of removed keys
+    /// is not known without reading the table back.
     pub fn prune_old_block_proofs(
         &mut self,
         finalized_slot: u64,
         tip_slot: u64,
-    ) -> Result<usize, Error> {
+    ) -> Result<u64, Error> {
         let cutoff = tip_slot.saturating_sub(BLOCK_PROOF_PRUNING_RANGE);
         // Only prune when the whole window is finalized; never touch
-        // non-finalized proofs.
-        if cutoff > finalized_slot {
+        // non-finalized proofs. A zero cutoff covers nothing.
+        if cutoff > finalized_slot || cutoff == 0 {
             return Ok(0);
         }
 
-        let view = self.backend.begin_read().expect("read view");
+        // Keys are slot||root in big-endian slot order, so the cutoff's bare
+        // slot prefix is an exact upper bound: keys below the cutoff sort
+        // before it, and keys at the cutoff sort after it (they extend it with
+        // a root). A single range delete drops them all without reading the
+        // table (and without walking the tombstones left by earlier prunes).
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .delete_range(
+                Table::BlockProof,
+                &0u64.to_be_bytes(),
+                &cutoff.to_be_bytes(),
+            )
+            .expect("delete finalized block proofs");
+        batch.commit().expect("commit");
 
-        // Keys are slot||root in big-endian slot order, so iteration ascends by
-        // slot: take entries below the cutoff and stop at the first one past it.
-        let keys_to_delete: Vec<Vec<u8>> = view
-            .prefix_iterator(Table::BlockProof, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
-            .map(|(key, _)| key.to_vec())
-            .take_while(|key| decode_slot_root_key(key).0 < cutoff)
-            .collect();
-        drop(view);
-
-        let count = keys_to_delete.len();
-        if count > 0 {
-            let mut batch = self.backend.begin_write().expect("write batch");
-            batch
-                .delete_batch(Table::BlockProof, keys_to_delete)
-                .expect("delete finalized block proofs");
-            batch.commit().expect("commit");
-        }
-        Ok(count)
+        Ok(cutoff)
     }
 
     /// Get the block header by root.
@@ -1980,12 +1976,12 @@ mod tests {
         // tip = range + 10, finalized = range + 5, so cutoff = tip - range = 10.
         let tip_slot = BLOCK_PROOF_PRUNING_RANGE + 10;
         let finalized_slot = BLOCK_PROOF_PRUNING_RANGE + 5;
-        let pruned = store
+        let pruned_below_slot = store
             .prune_old_block_proofs(finalized_slot, tip_slot)
             .expect("prune");
 
         // cutoff = 10: slots 0..9 pruned, slots 10..12 kept (within the window).
-        assert_eq!(pruned, 10);
+        assert_eq!(pruned_below_slot, 10);
         assert_eq!(count_entries(backend.as_ref(), Table::BlockProof), 3);
 
         // Oldest proofs are gone, but headers, bodies, and roots stay queryable.
@@ -2015,10 +2011,10 @@ mod tests {
         // cutoff = tip - range > finalized → prune nothing.
         let tip_slot = BLOCK_PROOF_PRUNING_RANGE + 100;
         let finalized_slot = 5;
-        let pruned = store
+        let pruned_below_slot = store
             .prune_old_block_proofs(finalized_slot, tip_slot)
             .expect("prune");
-        assert_eq!(pruned, 0);
+        assert_eq!(pruned_below_slot, 0);
         assert_eq!(count_entries(backend.as_ref(), Table::BlockProof), 10);
     }
 
@@ -2033,8 +2029,8 @@ mod tests {
 
         // Early chain: tip < BLOCK_PROOF_PRUNING_RANGE → cutoff saturates to 0,
         // so nothing is old enough to prune even though slots are finalized.
-        let pruned = store.prune_old_block_proofs(9, 9).expect("prune");
-        assert_eq!(pruned, 0);
+        let pruned_below_slot = store.prune_old_block_proofs(9, 9).expect("prune");
+        assert_eq!(pruned_below_slot, 0);
         assert_eq!(count_entries(backend.as_ref(), Table::BlockProof), 10);
     }
 
