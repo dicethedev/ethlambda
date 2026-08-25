@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ee57cac9.js";
+            window.path_to_searchindex_js = "searchindex-e6677ac6.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-274da26b.js"></script>
+        <script src="toc-3e38a8b2.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -182,17 +182,23 @@
 <p><strong>ethlambda</strong> is a minimalist, fast and modular implementation of the Lean Ethereum
 consensus client, written in Rust.</p>
 <p>This book collects the design notes and operator-facing references for ethlambda.
-It is split into two parts:</p>
+It is split into four parts:</p>
 <ul>
-<li><strong>Consensus</strong> explains the algorithms ethlambda implements: the
-<a href="#3sf-mini-justification--finalization">3SF-mini</a> justification and finalization rules, and the
-<a href="#-lmd-ghost-fork-choice-algorithm">LMD-GHOST</a> fork choice algorithm. Both documents are
-implementation-agnostic; ethlambda-specific behaviour is called out in
-blockquotes.</li>
+<li><strong>Design</strong> describes the shape of a running node: the
+<a href="#architecture">architecture</a> of its actors, workers and shared storage,
+and how they are wired together at startup.</li>
+<li><strong>Consensus</strong> explains how the chain advances: the
+<a href="#slots-and-intervals">slot and interval structure</a> that schedules every
+validator duty, the <a href="#3sf-mini-justification--finalization">3SF-mini</a> justification and finalization
+rules, and the <a href="#-lmd-ghost-fork-choice-algorithm">LMD-GHOST</a> fork choice algorithm. These
+documents are implementation-agnostic; ethlambda-specific behaviour is called
+out in blockquotes.</li>
 <li><strong>Operations</strong> documents observable surfaces of a running node:
 <a href="#metrics">Prometheus metrics</a>, <a href="#checkpoint-sync">checkpoint sync</a>,
 and the <a href="#fork-choice-visualization">fork choice visualization</a> served
 by the API.</li>
+<li><strong>Development</strong> collects notes for contributors, starting with the
+<a href="#spec-deviations">spec deviations</a> where ethlambda departs from leanSpec.</li>
 </ul>
 <p>For build and contribution instructions, see the
 <a href="https://github.com/lambdaclass/ethlambda/blob/main/README.md"><code>README</code></a> and
@@ -223,6 +229,307 @@ For comparison and cross-client testing:</p>
 <li><a href="https://github.com/geanlabs/gean">gean</a> (Go)</li>
 <li><a href="https://github.com/Pier-Two/lantern">Lantern</a> (C)</li>
 </ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="architecture"><a class="header" href="#architecture">Architecture</a></h1>
+<p>A running node is two actors, a few helper tasks, and one shared <code>Store</code>. The actors are
+genservers: each owns its state, and the only way in is a message.</p>
+<ul>
+<li><strong><code>BlockChainServer</code></strong> (<code>crates/blockchain/src/lib.rs</code>) drives consensus. It runs the slot
+clock, performs validator duties, imports blocks and attestations, and is the sole writer
+of consensus state.</li>
+<li><strong><code>P2PServer</code></strong> (<code>crates/net/p2p/src/lib.rs</code>) owns the network side: gossip publication,
+request/response, peer bookkeeping and long-range sync.</li>
+</ul>
+<p>Everything else hangs off those two: an aggregation worker on a blocking thread, the libp2p
+swarm loop on its own task, and the axum servers that expose the node to the outside world.</p>
+<blockquote>
+<p>Note: for what a genserver is, read <a href="https://blog.lambdaclass.com/introducing-spawned-erlang-style-actors-for-rust/">this blogpost on the <code>spawned</code> crate</a>.</p>
+</blockquote>
+<pre><code class="language-text">                        Tick (self-message, one per interval)
+                      ┌──────────────────────────────┐
+                      ▼                              │
+       ┌─────────────────────────────┐               │      ┌────────────────────┐
+       │      BlockChainServer       │───────────────┘      │  aggregation       │
+  ┌───▶│  actor, sole state writer   │─────── jobs ────────▶│  worker            │
+  │    │                             │◀───── aggregates ────│  (blocking thread) │
+  │    └──────────────┬──────────────┘                      └────────────────────┘
+  │                   │
+  │ P2PToBlockChain   │ BlockChainToP2P
+  │ new block/vote    │ publish, fetch block
+  │                   ▼
+  │    ┌─────────────────────────────┐  SwarmCommand   ┌────────────────────┐
+  └────│          P2PServer          │────────────────▶│   swarm adapter    │
+       │  actor, gossip + req/resp   │◀────────────────│   (libp2p task)    │◀══▶ peers
+       └─────────────────────────────┘   SwarmEvent    └────────────────────┘
+
+       ┌────────────────────────────────────────────────────────────────────┐
+       │ Store: pluggable key-value backend + in-memory fork-choice buffers │
+       │ written by BlockChainServer, read by P2PServer and the API servers │
+       └────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<h2 id="actor-protocols"><a class="header" href="#actor-protocols">Actor protocols</a></h2>
+<p>The two actors never share memory: they talk over the typed protocols in
+<code>crates/net/api/src/lib.rs</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Direction</th><th>Messages</th></tr>
+</thead>
+<tbody>
+<tr><td><code>BlockChain</code> → <code>P2P</code></td><td><code>publish_block</code>, <code>publish_attestation</code>, <code>publish_aggregated_attestation</code>, <code>fetch_block</code></td></tr>
+<tr><td><code>P2P</code> → <code>BlockChain</code></td><td><code>new_block</code> (tagged <code>Gossip</code> or <code>Sync</code>), <code>new_attestation</code>, <code>new_aggregated_attestation</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Both refs start as <code>None</code>. The <code>InitP2P</code> and <code>InitBlockChain</code> messages fill them in right
+after spawn, so neither actor needs the other to exist at construction time.</p>
+<h2 id="the-blockchainserver"><a class="header" href="#the-blockchainserver">The <code>BlockChainServer</code></a></h2>
+<h3 id="the-tick-loop"><a class="header" href="#the-tick-loop">The tick loop</a></h3>
+<p>The actor schedules its first <code>Tick</code> for genesis time, and every handler re-arms the next one
+at the following interval boundary. A handler that overruns that boundary re-arms with a zero
+delay instead, so the interval it just missed still gets its duty. The handler derives
+<code>(slot, interval)</code> from the wall clock, compares it against the store’s own interval counter,
+and skips ticks the store already passed.</p>
+<p><code>store::on_tick</code> then walks the store clock forward one interval at a time, fast-forwarding
+if it fell more than a slot behind, so a late tick still runs each interval’s bookkeeping in
+order. That walk and the actor split the duties:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Interval</th><th>In <code>store::on_tick</code></th><th>In the actor</th></tr>
+</thead>
+<tbody>
+<tr><td>0</td><td>accept new attestations, if we propose this slot</td><td>nothing: the build ran at the previous interval 4</td></tr>
+<tr><td>1</td><td>nothing</td><td>produce attestations, arm the early-aggregation check</td></tr>
+<tr><td>2</td><td>nothing</td><td>start the aggregation session</td></tr>
+<tr><td>3</td><td>update the safe target</td><td>nothing</td></tr>
+<tr><td>4</td><td>accept accumulated attestations</td><td>build and publish the next slot’s block</td></tr>
+</tbody>
+</table>
+</div>
+<p>See <a href="#slots-and-intervals">Slots and Intervals</a> for what each duty means at the protocol
+level, and why the proposer builds one interval early.</p>
+<p>The actor also advances its XMSS signing keys on every tick, and catches them up to the
+current slot once at spawn. The keys are one-time and slot-bound, so a node that skipped this
+would have nothing left to sign with.</p>
+<h3 id="block-import"><a class="header" href="#block-import">Block import</a></h3>
+<p>Blocks take the same path whether they arrived on gossip or came back from a <code>BlocksByRange</code>
+sync request. The actor verifies the signature, then runs the state transition
+(<code>crates/blockchain/state_transition</code>): <code>process_slots</code> advances the pre-state through empty
+slots, <code>process_block</code> validates the header and applies the block’s attestations, and the
+result is rejected unless the recomputed state root matches the one the proposer committed
+to. Justification and finalization move as part of that transition, following the
+<a href="#3sf-mini-justification--finalization">3SF-mini</a> rules. The actor then writes the block and its post-state, and
+recomputes the head with <a href="#-lmd-ghost-fork-choice-algorithm">LMD GHOST</a> (<code>crates/blockchain/fork_choice</code>).</p>
+<h3 id="aggregation-off-the-message-loop"><a class="header" href="#aggregation-off-the-message-loop">Aggregation off the message loop</a></h3>
+<p>XMSS proving costs hundreds of milliseconds, so it cannot run on the actor loop: a blocked
+actor stops importing blocks. The actor instead snapshots aggregation inputs from the store,
+ranks candidates by consensus value, and hands a job list to a <code>spawn_blocking</code> worker
+(<code>crates/blockchain/src/aggregation.rs</code>). The worker holds no store access, streams one
+<code>AggregateProduced</code> message back per finished job, and ends with <code>AggregationDone</code>. The actor
+publishes each result on gossip when it arrives.</p>
+<p>A soft deadline cancels the worker through a <code>CancellationToken</code>, so an overrunning slot
+cannot eat the next one. The session can also start up to <code>EARLY_AGGREGATION_WINDOW</code> before
+interval 2, once two thirds of the expected signatures are in. Either entry point counts as
+the slot’s one session, so a slot aggregates once. Starting early buys proving time, not an
+earlier publication: the worker holds each finished aggregate until the interval-2 boundary
+before delivering it to the actor.</p>
+<p>Block import runs a second, smaller aggregation path. <code>reaggregate.rs</code> splits an imported
+block’s merged proof back into per-attestation aggregates and folds them into the local pool,
+which is how a node that only saw a vote inside a block gets its fork-choice weight.
+Aggregators go one step further and republish those aggregates on gossip. Each split runs a
+fresh SNARK, so <code>reaggregate.rs</code> caps how many it does per block, and the actor skips the
+whole path while the node is catching up.</p>
+<h3 id="sync-gate"><a class="header" href="#sync-gate">Sync gate</a></h3>
+<p><code>sync_status.rs</code> tracks how far the local head lags the slot clock. Past the threshold the
+node reports itself syncing and stops attesting and proposing, since a head derived from a
+partial view is not worth voting for. A hysteresis band stops the state from flapping at the
+boundary, and a network-wide stall (nobody else is ahead either) leaves the node synced so
+its validators can help the chain recover. The same status feeds the <code>lean_node_sync_status</code>
+metric and, through a shared controller, the <code>/lean/v0/node/syncing</code> endpoint.
+<code>--disable-duty-sync-gate</code> reduces the gate to observe-only.</p>
+<h3 id="missing-parents"><a class="header" href="#missing-parents">Missing parents</a></h3>
+<p>The actor cannot import a block whose parent is unknown, so it parks the block in
+<code>pending_blocks</code> under its parent root and records the deepest missing ancestor it can find,
+walking back through already-stored pending blocks, in <code>pending_block_parents</code>. That ancestor
+is what it asks the <code>P2PServer</code> to fetch. Once the ancestor lands, the actor cascades down
+the parent index and re-imports every block that was waiting.</p>
+<h3 id="chain-events"><a class="header" href="#chain-events">Chain events</a></h3>
+<p>The actor is the sole publisher on an <code>EventBus</code> (<code>crates/blockchain/src/events.rs</code>), which
+carries seven topics: head moves, imports and gossip sightings of blocks, single votes and
+aggregates, plus justification and finalization updates. The bus is best-effort:
+emission never blocks the actor, and a slow subscriber loses events instead of
+back-pressuring consensus. The API server subscribes one receiver per SSE client.</p>
+<h2 id="the-p2pserver"><a class="header" href="#the-p2pserver">The <code>P2PServer</code></a></h2>
+<p>Only the swarm adapter task touches the <code>libp2p::Swarm</code>. The actor sends it <code>SwarmCommand</code>s
+(publish, dial, send request, send response) and receives <code>SwarmEvent</code>s back as actor
+messages. That split keeps non-<code>Clone</code> swarm types (response channels, for one) out of the
+typed protocol, and keeps the adapter polling network I/O while the actor is busy with a
+message.</p>
+<p>What the actor does with those events:</p>
+<ul>
+<li><strong>Gossip.</strong> It decodes blocks, aggregates and per-subnet attestations, then forwards them
+to the <code>BlockChainServer</code>. The node computes its subscriptions once at startup from its
+validator set and aggregator role, and never revisits them.</li>
+<li><strong>Status.</strong> Sent on the first connection to a peer, not on every redundant one. When a peer
+reports a head ahead of ours, the actor opens a long-range sync range or extends the one it
+has, then requests <code>BlocksByRange</code> batches one at a time, dropping peers that fall behind
+the range.</li>
+<li><strong><code>BlocksByRoot</code>.</strong> Backs the <code>fetch_block</code> requests above. Retries use exponential backoff
+and prefer a peer that has not already failed for that root, falling back to the full
+connected set once every peer has failed.</li>
+</ul>
+<p>The <code>P2PServer</code> holds its own <code>Store</code> clone, which it only ever reads, so it answers <code>Status</code>
+and <code>BlocksBy*</code> requests without a round trip through the consensus actor.</p>
+<h2 id="the-store"><a class="header" href="#the-store">The <code>Store</code></a></h2>
+<p>The <code>Store</code> follows a similar approach as ethrex’s: a safe, easy to use interface over a
+pluggable key-value backend (<code>StorageBackend</code>, RocksDB for a normal node and in-memory for
+tests and the Hive test driver).
+Cloning one shares the backend, the state LRU cache, and the in-memory buffers that fork
+choice runs on: the new and known attestation payload buffers, the latest votes, and the
+gossip signatures awaiting aggregation. The node never persists those buffers, since they
+only matter for the slot they belong to.</p>
+<p>Every component gets a clone, but only the <code>BlockChainServer</code> writes consensus state. A
+reader can therefore hold a handle without interleaving with a state transition.</p>
+<p>See <a href="#-storage-what-lives-where">Data Storage</a> for the table layout, the snapshot/diff scheme used for
+states, and pruning rules.</p>
+<h2 id="http-api"><a class="header" href="#http-api">HTTP API</a></h2>
+<p>We use <code>axum</code> as our API router, with requests served in tokio tasks. Handlers read node state
+without messaging the actors: the <code>Store</code> is router state, and the <code>EventBus</code> and the runtime
+controllers arrive as extension layers. Metrics and debug endpoints live in their own routers,
+on a port you configure separately: distinct ports bind two independent servers, equal ports
+merge all three routers onto a single listener. See <a href="#http-api-1">HTTP API</a> for the endpoint
+reference.</p>
+<h2 id="startup"><a class="header" href="#startup">Startup</a></h2>
+<p><code>bin/ethlambda/src/main.rs</code> wires the node in a fixed order. Everything before the actors
+spawn is fail-fast, so a misconfigured node stops at boot instead of hours later.</p>
+<ol>
+<li>Install the tracing subscriber, parse CLI options, register metrics, raise the
+file-descriptor limit for RocksDB’s unbounded table cache.</li>
+<li>Load the node key, then genesis config, validator config, bootnode ENRs and validator keys.</li>
+<li>Open the database, then pick an anchor: resume from disk if the on-disk head is recent
+enough, otherwise <a href="#checkpoint-sync">checkpoint sync</a> from the configured URLs, and
+otherwise build the genesis state. A stale database with no checkpoint URL configured is
+resumed anyway, with a warning, since that is the setup the node was given.</li>
+<li>Build the shared handles: aggregator controller, sync-status controller, event bus, and
+the subnet set that both the swarm and the actor need to agree on.</li>
+<li>Spawn <code>BlockChainServer</code> (which schedules its first tick for genesis time), build the
+swarm, spawn <code>P2PServer</code>, and wire the two together with <code>InitP2P</code> and <code>InitBlockChain</code>.</li>
+<li>Spawn the API and metrics servers.</li>
+</ol>
+<p>Shutdown runs in reverse: the first ctrl+c stops both actors and cancels the servers’
+shutdown token, and three more force the process to exit if a graceful stop hangs.</p>
+<blockquote>
+<p>Note: booting with <code>HIVE_LEAN_TEST_DRIVER=1</code> short-circuits everything from step 2 on and
+exposes only the Hive test-driver endpoints, so a driver run never touches the node key,
+the genesis config or any other consensus prerequisite.</p>
+</blockquote>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="slots-and-intervals"><a class="header" href="#slots-and-intervals">Slots and Intervals</a></h1>
+<p>A Lean Chain slot has a duration of 4 seconds and is divided in 5 intervals of 800 ms.
+Every duty a validator owes the chain is due in one of them:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Interval</th><th>Offset</th><th>Duty</th><th>Who acts</th><th>What it publishes</th></tr>
+</thead>
+<tbody>
+<tr><td>0</td><td>t+0 ms</td><td><a href="#interval-0-block-proposal">Block proposal</a></td><td>the slot’s proposer</td><td>the block, on the <code>block</code> topic</td></tr>
+<tr><td>1</td><td>t+800 ms</td><td><a href="#interval-1-vote-propagation">Vote propagation</a></td><td>every validator</td><td>a signed attestation, on its subnet topic</td></tr>
+<tr><td>2</td><td>t+1600 ms</td><td><a href="#interval-2-vote-aggregation">Vote aggregation</a></td><td>aggregators</td><td>an aggregated attestation, on the <code>aggregation</code> topic</td></tr>
+<tr><td>3</td><td>t+2400 ms</td><td><a href="#interval-3-safe-target-computation">Safe target computation</a></td><td>every validator</td><td>nothing: local bookkeeping</td></tr>
+<tr><td>4</td><td>t+3200 ms</td><td><a href="#interval-4-head-update">Head update</a></td><td>every validator</td><td>nothing: local bookkeeping</td></tr>
+</tbody>
+</table>
+</div>
+<pre><code class="language-text">                             ONE SLOT (4000 ms)
+    ┌────────────┬────────────┬────────────┬────────────┬────────────┐
+    │ Interval 0 │ Interval 1 │ Interval 2 │ Interval 3 │ Interval 4 │
+    │  t+0 ms    │  t+800 ms  │ t+1600 ms  │ t+2400 ms  │ t+3200 ms  │
+    ├────────────┼────────────┼────────────┼────────────┼────────────┤
+    │   block    │    vote    │    vote    │safe target │    head    │
+    │  proposal  │propagation │aggregation │computation │   update   │
+    └────────────┴────────────┴────────────┴────────────┴────────────┘
+     ◄───────────── gossiped ─────────────▶ ◄───── local only ───────▶
+</code></pre>
+<p>The grid comes from a genesis timestamp every node shares, so the schedule needs no
+coordination messages: a node reads its clock, works out which interval it is in, and
+knows which duty is due. The order is a dependency chain, since each interval consumes
+what the previous one produced. A duty that overruns its interval is not rescheduled: it
+lands late, and the slot moves on without it.</p>
+<blockquote>
+<p><strong>In ethlambda:</strong> the intervals are the <code>SlotInterval</code> variants in
+<code>crates/blockchain/src/lib.rs</code>, and their length comes from
+<code>MILLISECONDS_PER_INTERVAL</code> and <code>INTERVALS_PER_SLOT</code> in
+<code>crates/common/types/src/constants.rs</code>.</p>
+</blockquote>
+<h2 id="interval-0-block-proposal"><a class="header" href="#interval-0-block-proposal">Interval 0: Block proposal</a></h2>
+<p>A block proposer, selected in a round-robin fashion (<code>slot % num_validators</code>), proposes a
+new block and gossips it to the network. Right before building the block, the proposer
+merges their “new attestations buffer” into their fork-choice view. They then include
+attestations that the proposer has recently seen into their block. Other validators verify
+the block and its contents, and merge the votes it includes into their fork-choice view.
+After importing a block, all validators <a href="#-lmd-ghost-fork-choice-algorithm">recompute their head</a>, and update
+the latest <a href="#3sf-mini-justification--finalization">finalized and justified checkpoints</a> according to the block’s
+post-state.</p>
+<p>A block body carries at most <code>MAX_ATTESTATIONS_DATA</code> aggregated attestations: distinct
+<code>(slot, head, target, source)</code> tuples, each paired with a bitfield naming the validators
+bound to it.
+Genesis occupies slot 0, so proposals start at slot 1, and nothing forces a slot to be
+filled: a proposer that is offline or too slow leaves an empty slot, and the next block
+simply points its parent root at an older block.</p>
+<blockquote>
+<p><strong>In ethlambda:</strong> block proposal is merged into the previous slot’s head-update
+interval: the proposer advances its store to the next slot, builds the block there,
+and holds publication until the slot boundary. That buys the build one extra interval
+of headroom and leaves no actor work at the block-proposal tick itself.</p>
+</blockquote>
+<h2 id="interval-1-vote-propagation"><a class="header" href="#interval-1-vote-propagation">Interval 1: Vote propagation</a></h2>
+<p>Validators gossip their votes for the block they consider to be the head of the chain, and
+append to it a <code>(source, target)</code> <a href="#recap-attestation-anatomy">finality vote</a>.
+These votes are in aggregation subnets and are imported by aggregators. Aggregators verify
+the votes in their subnet and store them for later aggregation.</p>
+<blockquote>
+<p><strong>In ethlambda:</strong> a validator’s subnet is <code>validator_index % attestation_committee_count</code>,
+and a node only aggregates for subnets it subscribed to at startup. Aggregation is also
+gated on the aggregator role, seeded by <code>--is-aggregator</code> and flippable at runtime
+through the admin API. A chain whose validators all decline the role still gossips votes
+and logs them as processed, but no aggregate is ever produced, so every block is empty
+and the chain never justifies.</p>
+</blockquote>
+<h2 id="interval-2-vote-aggregation"><a class="header" href="#interval-2-vote-aggregation">Interval 2: Vote aggregation</a></h2>
+<p>Aggregators aggregate the votes they have received and gossip the resulting aggregated
+attestations to the network. These aggregated attestations are imported by all validators,
+who verify and store them in a “new attestations buffer”.</p>
+<p>Aggregation earns its own interval because collapsing a subnet’s worth of XMSS signatures
+into one proof is the heaviest recurring computation in the client. It is also what makes a
+block affordable, since a block carrying raw votes would need one full XMSS signature per
+voter, quickly going over the network bandwidth limit.</p>
+<blockquote>
+<p><strong>In ethlambda:</strong> the proofs run on an off-thread worker so the blockchain actor’s
+message loop stays responsive, and a session may start up to <code>EARLY_AGGREGATION_WINDOW</code>
+before the interval boundary once two thirds of the signatures are in. At the session’s
+soft deadline the actor stops handing out new jobs, but a proof already in flight
+finishes and publishes late rather than being discarded.</p>
+</blockquote>
+<h2 id="interval-3-safe-target-computation"><a class="header" href="#interval-3-safe-target-computation">Interval 3: Safe target computation</a></h2>
+<p>Validators compute the <a href="#safe-target-selection">safe target</a> they’ll use when
+deciding which finality vote to cast on the next slot. The safe target is computed based on
+the votes received in the current slot.</p>
+<p>It is LMD-GHOST again, but run over just the votes that arrived this slot and with a
+two-thirds weight threshold, where head selection applies none. The safe target therefore
+sits at or behind the head and advances only once a branch is backed by a supermajority.
+Deriving targets from it is what stops <a href="#3sf-mini-justification--finalization">3SF-mini</a> from justifying a branch
+the network has not visibly converged on.</p>
+<h2 id="interval-4-head-update"><a class="header" href="#interval-4-head-update">Interval 4: Head update</a></h2>
+<p>Validators merge the aggregated attestations they have in their “new attestations buffer”
+into their fork-choice view, and recompute their head.</p>
+<p>This is the slot’s second and last promotion point; the first is the proposer’s, just
+before it builds. Until a vote is promoted it carries no weight in head selection, which is
+what keeps a validator’s fork-choice view from shifting under it mid-slot. The safe target
+is the exception: it reads the unpromoted buffer directly, which is how it stays a view of
+this slot alone. See <a href="#why-staged-promotion">why staged promotion</a> for the
+reasoning.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="3sf-mini-justification--finalization"><a class="header" href="#3sf-mini-justification--finalization">3SF-mini: Justification &amp; Finalization</a></h1>
 <p>ethlambda uses <strong>3SF-mini</strong> (Three-Stage Finality, minimal version) for justification
@@ -1128,9 +1435,9 @@ designated moments. This ensures all validators operate on a consistent view.</p
                           fixed points
 </code></pre>
 <blockquote>
-<p><strong>In ethlambda:</strong> The two stages are called “new” and “known” attestations, stored
-in <code>LatestNewAttestations</code> and <code>LatestKnownAttestations</code> tables respectively.
-Promotion happens at tick intervals 0 (if proposing) and 3 (end of slot).</p>
+<p><strong>In ethlambda:</strong> The two stages are called “new” and “known” attestations, held in
+the in-memory <code>new_payloads</code> and <code>known_payloads</code> buffers of the <code>Store</code> respectively.
+Promotion happens at tick intervals 0 (if proposing) and 4 (end of slot).</p>
 </blockquote>
 <h3 id="why-staged-promotion"><a class="header" href="#why-staged-promotion">Why Staged Promotion?</a></h3>
 <p>The staged design serves two purposes:</p>
@@ -1278,25 +1585,26 @@ November 2018 due to superior stability properties.</p>
 <p>This section covers ethlambda-specific details: scheduling, Beacon Chain differences,
 source code locations, and performance.</p>
 <h3 id="tick-based-scheduling"><a class="header" href="#tick-based-scheduling">Tick-Based Scheduling</a></h3>
-<p>ethlambda divides time into <strong>4-second slots</strong>, each split into <strong>4 intervals</strong> (1 second
-each). Fork choice operations are scheduled at specific intervals:</p>
-<pre><code class="language-text">                          ONE SLOT (4 seconds)
-    ┌──────────────┬──────────────┬──────────────┬──────────────┐
-    │  Interval 0  │  Interval 1  │  Interval 2  │  Interval 3  │
-    │   (t+0s)     │   (t+1s)     │   (t+2s)     │   (t+3s)     │
-    ├──────────────┼──────────────┼──────────────┼──────────────┤
-    │              │              │              │              │
-    │ IF PROPOSER: │ NON-PROPOSER:│ update_safe  │ accept_new   │
-    │  accept new  │  produce     │ _target()    │ _attestations│
-    │  attestations│  attestation │              │ ()           │
-    │  + propose   │              │ (2/3 vote    │              │
-    │  block       │              │  threshold)  │ update_head()│
-    │              │              │              │              │
-    │ update_head()│              │              │              │
-    │              │              │              │              │
-    └──────────────┴──────────────┴──────────────┴──────────────┘
+<p>ethlambda divides time into <strong>4-second slots</strong>, each split into <strong>5 intervals</strong> (800 ms
+each), as described in <a href="#slots-and-intervals">Slots and Intervals</a>. Fork choice
+operations are scheduled at specific intervals:</p>
+<pre><code class="language-text">                             ONE SLOT (4000 ms)
+    ┌────────────┬────────────┬────────────┬────────────┬────────────┐
+    │ Interval 0 │ Interval 1 │ Interval 2 │ Interval 3 │ Interval 4 │
+    │  t+0 ms    │  t+800 ms  │ t+1600 ms  │ t+2400 ms  │ t+3200 ms  │
+    ├────────────┼────────────┼────────────┼────────────┼────────────┤
+    │            │            │            │            │            │
+    │IF PROPOSER:│ ALL        │ aggregators│update_safe │accept_new_ │
+    │ accept new │ VALIDATORS:│ publish    │_target()   │attestations│
+    │ attestation│  produce   │ aggregated │            │()          │
+    │ + propose  │ attestation│ attestation│ (2/3 vote  │            │
+    │ block      │            │            │ threshold) │update_head │
+    │            │            │            │            │()          │
+    │update_head │            │            │            │            │
+    │()          │            │            │            │            │
+    └────────────┴────────────┴────────────┴────────────┴────────────┘
 
-    ◄─────────────── Slot N ──────────────────────────────────────►
+    ◄─────────────── Slot N ──────────────────────────────────────────►
 </code></pre>
 <p><strong>Detailed sequence:</strong></p>
 <pre><code class="language-text">    Interval 0 ─ Slot boundary
@@ -1310,20 +1618,25 @@ each). Fork choice operations are scheduled at specific intervals:</p>
     │
     Interval 1 ─ Attestation production
     │
-    ├── Non-proposers:
+    ├── All validators, proposer included:
     │   └── Create attestation with:
     │       • head   = current fork choice head (newest head)
     │       • target = derived from safe_target (for 3SF-mini)
     │       • source = latest_justified checkpoint
     │       Publish attestation to gossipsub
     │
-    Interval 2 ─ Safe target update
+    Interval 2 ─ Aggregation
+    │
+    ├── Aggregators: aggregate their subnet's gossip signatures
+    │   └── Publish the aggregated attestation to gossipsub
+    │
+    Interval 3 ─ Safe target update
     │
     ├── Recalculate safe_target using 2/3 supermajority threshold
     │   └── Only blocks with ≥ ⌈2V/3⌉ attestation weight qualify
     │       (V = total validators)
     │
-    Interval 3 ─ End of slot
+    Interval 4 ─ End of slot
     │
     ├── Promote new → known attestations
     └── Run fork choice → update_head()
@@ -1418,7 +1731,7 @@ all operations complete in sub-millisecond time. The <code>// TODO: add proto-ar
 proto-array is an O(1) amortized fork choice algorithm used by most Beacon Chain
 clients.</p>
 <div style="break-before: page; page-break-before: always;"></div>
-<h1 id="http-api"><a class="header" href="#http-api">HTTP API</a></h1>
+<h1 id="http-api-1"><a class="header" href="#http-api-1">HTTP API</a></h1>
 <p>ethlambda exposes HTTP over <strong>two independent <a href="https://github.com/tokio-rs/axum">Axum</a> servers</strong> on separate ports, so the API and the metrics/debug surface can have different network policies:</p>
 <ul>
 <li><strong>API server</strong> — consensus data (blocks, states, checkpoints, fork choice) and admin controls.</li>
@@ -2531,6 +2844,33 @@ to checkpoint sync, which writes a fresh anchor on top of the existing data.</p>
 </tbody>
 </table>
 </div>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="spec-deviations"><a class="header" href="#spec-deviations">Spec Deviations</a></h1>
+<p>ethlambda diverges from the <a href="https://github.com/leanEthereum/leanSpec">leanSpec</a>
+reference in a few places, mainly for performance reasons. This page lists those
+deviations; each will be fleshed out with rationale, implementation notes, and
+trade-offs over time.</p>
+<h2 id="asynchronous-signature-aggregation-with-an-early-start-and-an-early-stop"><a class="header" href="#asynchronous-signature-aggregation-with-an-early-start-and-an-early-stop">Asynchronous signature aggregation with an early start and an early stop</a></h2>
+<p>Aggregation runs off the main BlockChainServer actor loop, may start before its
+interval, and stops early once it runs out of time.</p>
+<ul>
+<li><strong>ethlambda:</strong> the actor snapshots everything aggregation needs (<code>snapshot_aggregation_inputs</code>, <code>crates/blockchain/src/aggregation.rs</code>) and spawns a <code>tokio::task::spawn_blocking</code> worker (<code>run_aggregation_worker</code>, <code>aggregation.rs</code>). Candidates are the store’s gossip-signature groups plus payload-only groups (<code>new_payload_keys</code>, which need at least two existing proofs to merge). A tiered greedy selector orders them by consensus value (current-slot before stale, then <code>Finalize &gt; Justify &gt; Build</code>, mirroring the block builder) and emits at most <code>MAX_AGGREGATION_JOBS</code> jobs, dropping to a single job in the slot before one of our validators proposes. The worker streams each finished group back as an <code>AggregateProduced</code> message; the actor loop is never blocked on XMSS work.</li>
+<li><strong>Early start:</strong> a session normally fires at interval 2, but may start up to <code>EARLY_AGGREGATION_WINDOW</code> earlier once the 2/3 signature threshold is already met (<code>maybe_start_early_aggregation</code>, <code>crates/blockchain/src/lib.rs</code>), so the proof lands earlier in the slot.</li>
+<li><strong>Early stop:</strong> a <code>send_after(AGGREGATION_DEADLINE, ...)</code> timer cancels the session that long after <strong>session start</strong>, so a session that started early also ends early (<code>AGGREGATION_DEADLINE</code>, <code>aggregation.rs</code>). The worker checks <code>cancel.is_cancelled()</code> before each job (<code>aggregation.rs</code>); in-flight jobs finish, remaining jobs are dropped.</li>
+<li><strong>leanSpec:</strong> <code>aggregate()</code> is called inline and synchronously from <code>tick_interval</code>, at interval 2 only. It walks every attestation data with fresh evidence, with no job cap, no time budget, no worker, and no cancellation.</li>
+<li><strong>Equivalence:</strong> on cancellation the worker emits only the groups that finished, so a slot may pack fewer aggregates than the synchronous path would; any such subset still yields a valid block, affecting how many votes are included rather than signature validity. The job cap has the same character: it bounds prover work per slot, not what a block may carry.</li>
+</ul>
+<h2 id="attestation-scoring-on-block-building"><a class="header" href="#attestation-scoring-on-block-building">Attestation scoring on block building</a></h2>
+<p>Attestations are scored and selected when packing a block, rather than taken in
+target-slot order as they are scanned.</p>
+<ul>
+<li><strong>ethlambda:</strong> <code>select_attestations</code> (<code>crates/blockchain/src/block_builder.rs</code>) ranks candidate <code>AttestationData</code> entries by tier <code>Finalize &gt; Justify &gt; Build</code> (<code>enum Tier</code>, <code>block_builder.rs</code>). The within-tier order is tier-dependent (<code>EntryScore::ordering_key</code>, <code>block_builder.rs</code>): <code>Finalize</code>/<code>Justify</code> entries already cross 2/3, so newer chain progress leads (target slot, attestation slot, then new-voter count); <code>Build</code> entries only add marginal voters, so coverage leads (new-voter count, target slot, then attestation slot). <code>data_root</code> is the final deterministic tiebreak in both tiers. Each round picks the best candidate against a projected post-state.</li>
+<li><strong>Proposer budget:</strong> rounds stop at <code>max_attestations_per_block</code> distinct <code>AttestationData</code> entries (<code>--max-attestations-per-block</code>, default 3), clamped to <code>MAX_ATTESTATIONS_DATA</code>. The <em>consensus</em> cap is <code>MAX_ATTESTATIONS_DATA</code>, the same value leanSpec enforces in its state transition; only the proposer-side budget differs, and it is configurable.</li>
+<li><strong>Collapsing duplicate data:</strong> a winning entry may carry several proofs, which must collapse to one proof per <code>AttestationData</code> before the block is valid. By default ethlambda keeps only the best-coverage proof and <strong>drops</strong> the rest (<code>keep_best_proof_per_data</code>, <code>block_builder.rs</code>), skipping the leanVM merge at the cost of the voters those proofs carried. With <code>--enable-proposer-aggregation</code>, <code>compact_attestations</code> (<code>block_builder.rs</code>) instead merges them through recursive proof aggregation, which is what leanSpec always does.</li>
+<li><strong>leanSpec:</strong> <code>build_block</code> scans candidates sorted by <code>(target.slot, data_root)</code>, oldest target first, and includes the first ones that pass its filters (greedy, no scoring), re-running the scan as a fixed point when justification/finalization advances. Its proposer budget is <code>MAX_ATTESTATIONS_DATA</code> itself.</li>
+<li><strong>Equivalence:</strong> both produce a valid block. ethlambda front-loads the attestations that advance justification and finality, and within those tiers prefers the <em>newest</em> target where leanSpec takes the <em>oldest</em>; combined with the smaller default budget, an older entry can be outranked by newer ones round after round, so which votes reach peers through blocks differs even though every block stays valid. The smaller budget yields smaller blocks and lower build times.</li>
+<li><strong>Upstream status:</strong> the tiered strategy is proposed upstream as leanSpec <a href="https://github.com/leanEthereum/leanSpec/pull/1149">PR #1149</a> (open at the time of writing), so this deviation may converge; the recursive-merge collapse follows leanSpec #510.</li>
+</ul>
 
                     </main>
 
