@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e6677ac6.js";
+            window.path_to_searchindex_js = "searchindex-d1711995.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-3e38a8b2.js"></script>
+        <script src="toc-a5d5bf8e.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -229,7 +229,7 @@
 <tr><td><code>lean_block_building_time_seconds</code></td><td>Histogram</td><td>Time taken to build a block</td><td>On block production</td><td></td><td>0.1, 0.25, 0.5, 0.75, 1, 2, 4, 8</td><td>✅</td></tr>
 <tr><td><code>lean_block_building_success_total</code></td><td>Counter</td><td>Successful block builds</td><td>On block production</td><td></td><td></td><td>✅</td></tr>
 <tr><td><code>lean_block_building_failures_total</code></td><td>Counter</td><td>Failed block builds (error building the block, signing the block root, or processing it locally)</td><td>On block production failure</td><td></td><td></td><td>✅</td></tr>
-<tr><td><code>lean_block_proposal_attestation_build_phase_seconds</code></td><td>Histogram</td><td>Phase-level time in block-proposal attestation selection</td><td>On block production</td><td>phase=select_payloads,compact,stf_simulate</td><td>0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8</td><td>✅</td></tr>
+<tr><td><code>lean_block_proposal_attestation_build_phase_seconds</code></td><td>Histogram</td><td>Phase-level time in block proposal: attestation selection, compaction, state transition, then the seal (proposer signature, type-1 wrap, type-2 merge)</td><td>On block production</td><td>phase=select_payloads,compact,stf_simulate,sign_proposer,wrap_proposer,merge_type2</td><td>0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8</td><td>✅</td></tr>
 <tr><td><code>lean_block_proposal_attestation_builds_total</code></td><td>Counter</td><td>Attestations selected during block-proposal selection (one per selection-loop round that picks an <code>AttestationData</code>)</td><td>On each attestation selection</td><td></td><td></td><td>✅</td></tr>
 <tr><td><code>lean_block_proposal_child_payloads_consumed_total</code></td><td>Counter</td><td>Child aggregated payloads selected during greedy proof picking (before compaction)</td><td>On block production</td><td></td><td></td><td>✅</td></tr>
 <tr><td><code>lean_block_proposal_attestation_data_selected</code></td><td>Histogram</td><td>Distinct <code>AttestationData</code> entries in the proposal block body</td><td>On block production</td><td></td><td>0, 1, 2, 4, 8, 16, 32</td><td>✅</td></tr>
@@ -347,8 +347,46 @@ phases it contains.</p>
 </tbody>
 </table>
 </div>
+<h3 id="peer-discovery"><a class="header" href="#peer-discovery">Peer Discovery</a></h3>
+<p>Only emitted when discv5 discovery is enabled (<code>--discovery.enable</code>); see
+<a href="./discovery.html">Peer discovery</a>. Counts dials discovery initiated, as opposed to
+the static bootnode dials every node makes. Connection outcomes are not repeated
+here: a discovery dial that succeeds or fails shows up in
+<code>lean_peer_connection_events_total</code> like any other.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_discovered_peers_dialed_total</code></td><td>Counter</td><td>Peers dialed as a result of discv5 discovery</td><td>On dialing a discovered peer</td><td></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="transport-mix"><a class="header" href="#transport-mix">Transport Mix</a></h3>
+<p>Which transport actually carried each established connection, read off the
+connection’s own multiaddr rather than off the address we dialed: libp2p races a
+peer’s QUIC and TCP addresses within one dial, so the answer is not knowable
+before the connection exists. <code>tcp</code> counts are what say the fallback in
+<a href="./discovery.html">Peer discovery</a> is doing work rather than merely being
+advertised.</p>
+<p>Counts connections rather than peers, so it can exceed
+<code>lean_peer_connection_events_total{result="success"}</code>, which fires only on a
+peer’s first connection. <code>unknown</code> covers a multiaddr naming neither transport,
+which nothing ethlambda binds produces.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_peer_connections_by_transport_total</code></td><td>Counter</td><td>Established peer connections by the transport that carried them</td><td>On connection established</td><td>direction=inbound,outbound<br>transport=quic,tcp,unknown</td></tr>
+</tbody>
+</table>
+</div>
 <h3 id="gossip-arrival-timing"><a class="header" href="#gossip-arrival-timing">Gossip Arrival Timing</a></h3>
 <p>These histograms record the absolute distance between a gossip message’s arrival and the start of the interval it was due in, so an arrival that is early by some amount and one that is late by the same amount land in the same bucket; the counters’ <code>position</code> label is what tells them apart. <code>inside</code> means the message arrived within the interval it was due in, not merely somewhere in the right slot: an attestation for slot 10 that lands during slot 10’s interval 2 is <code>after</code>, not <code>inside</code>, since it missed the AttestationProduction interval it was actually due in.</p>
+<p>The bucket boundaries are the interval and slot edges of the default 4-second cadence. Prometheus fixes buckets when a histogram is registered, so a network that sets <code>MILLISECONDS_PER_SLOT</code> reads these histograms against the default grid rather than its own; the <code>position</code> label still follows the configured interval width.</p>
 <p>Blocks anchor to interval 0 of their own slot and attestations to interval 1 of their data slot; both are unbounded above, so a message that never arrives close to real time can be arbitrarily late. Aggregates anchor instead to the most recent aggregation-interval boundary rather than their own data slot, since a stale-group catch-up aggregate can carry a <code>data.slot</code> several slots in the past; anchoring to the latest boundary bounds the delay to one slot and rules out <code>before</code> entirely.</p>
 <p>Only gossip-received blocks are sampled here: blocks fetched via req/resp during sync are excluded, since sync backfill delivers blocks long after they were due and would swamp these histograms with catch-up noise rather than gossip-health signal.</p>
 <p>The aggregate metrics do include an aggregator’s own freshly produced aggregates, which never come back over gossip; without them an aggregator would report an empty aggregate profile. The two populations are not quite the same measurement: delivery of a locally produced aggregate is held until the interval-2 boundary, so it lands near zero unless proving overran the interval, whereas a received one adds propagation on top of whenever the producer managed to publish it.</p>
