@@ -1,11 +1,11 @@
 use std::collections::HashSet;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ethlambda_network_api::BlockSource;
 use ethlambda_storage::Store;
 use libp2p::{PeerId, request_response};
 use rand::seq::SliceRandom;
 use spawned_concurrency::tasks::{Context, send_after};
-use std::time::Duration;
 use tracing::{debug, error, trace, warn};
 
 use ethlambda_types::checkpoint::Checkpoint;
@@ -161,6 +161,7 @@ async fn handle_status_request(
     peer: PeerId,
 ) {
     trace!(finalized_slot=%request.finalized.slot, head_slot=%request.head.slot, "Received status request from peer {peer}");
+    observe_peer_head(&server.store, &request, peer);
     let our_status = build_status(&server.store);
     let response = Response::success(ResponsePayload::Status(our_status));
     server.swarm_handle.send_response(channel, response);
@@ -168,6 +169,10 @@ async fn handle_status_request(
 
 async fn handle_status_response(server: &mut P2PServer, status: Status, peer: PeerId) {
     trace!(finalized_slot=%status.finalized.slot, head_slot=%status.head.slot, "Received status response from peer {peer}");
+
+    if !observe_peer_head(&server.store, &status, peer) {
+        return;
+    }
 
     let our_head_slot = server.store.head_slot();
     if status.head.slot <= our_head_slot {
@@ -198,6 +203,31 @@ async fn handle_status_response(server: &mut P2PServer, status: Status, peer: Pe
 
     request_next_range_batch(server).await;
     trace!(%peer, start_slot, gap, "Long-range sync: using BlocksByRange");
+}
+
+/// Record a peer's head when it is not implausibly ahead of the local wall clock.
+fn observe_peer_head(store: &Store, status: &Status, peer: PeerId) -> bool {
+    let config = store.config();
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_else(|_| config.genesis_time_ms());
+    let current_slot =
+        now_ms.saturating_sub(config.genesis_time_ms()) / config.milliseconds_per_slot;
+    let max_head_slot = current_slot.saturating_add(1);
+
+    if status.head.slot > max_head_slot {
+        warn!(
+            %peer,
+            peer_head_slot = status.head.slot,
+            current_slot,
+            "Ignoring peer status with a future head"
+        );
+        return false;
+    }
+
+    store.observe_block_slot(status.head.slot);
+    true
 }
 
 async fn handle_blocks_by_root_request(
@@ -607,6 +637,46 @@ mod tests {
             },
             proof: MultiMessageAggregate::default(),
         }
+    }
+
+    #[test]
+    fn peer_status_advances_latest_known_block_slot() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let store = Store::from_anchor_state(
+            backend,
+            State::from_genesis(0, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+        let status = Status {
+            finalized: Checkpoint::default(),
+            head: Checkpoint {
+                root: H256::ZERO,
+                slot: 550,
+            },
+        };
+
+        assert!(observe_peer_head(&store, &status, PeerId::random()));
+        assert_eq!(store.latest_known_block_slot(), 550);
+    }
+
+    #[test]
+    fn peer_status_rejects_implausibly_future_head() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let store = Store::from_anchor_state(
+            backend,
+            State::from_genesis(0, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+        let status = Status {
+            finalized: Checkpoint::default(),
+            head: Checkpoint {
+                root: H256::ZERO,
+                slot: u64::MAX,
+            },
+        };
+
+        assert!(!observe_peer_head(&store, &status, PeerId::random()));
+        assert_eq!(store.latest_known_block_slot(), 0);
     }
 
     #[test]
