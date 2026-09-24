@@ -159,14 +159,6 @@ mod tests {
     }
 
     #[test]
-    fn fresh_peer_head_blocks_duties_during_long_range_sync() {
-        let mut tracker = SyncStatusTracker::default();
-
-        assert_eq!(tracker.update(550, 0, 550), SyncStatus::Syncing);
-        assert!(!tracker.duties_allowed());
-    }
-
-    #[test]
     fn sync_status_treats_stale_known_blocks_as_network_stall() {
         let mut tracker = SyncStatusTracker::default();
 

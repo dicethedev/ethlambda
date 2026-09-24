@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::SystemTime;
 
 use lru::LruCache;
 
@@ -875,6 +876,16 @@ impl Store {
         self.time().expect("store time exists") / INTERVALS_PER_SLOT
     }
 
+    /// Return the slot containing the current wall-clock time.
+    pub fn wall_clock_slot(&self) -> u64 {
+        let genesis_ms = self.config.genesis_time_ms();
+        let now_ms = SystemTime::UNIX_EPOCH
+            .elapsed()
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(genesis_ms);
+        now_ms.saturating_sub(genesis_ms) / self.config.milliseconds_per_slot
+    }
+
     /// Record evidence that a block exists at `slot`.
     ///
     /// The marker is monotonic for the lifetime of the process and shared by
@@ -1077,17 +1088,6 @@ impl Store {
                 (root, (slot, parent_root))
             })
             .collect())
-    }
-
-    /// Return the highest slot in the live chain.
-    pub fn max_live_chain_slot(&self) -> Result<Option<u64>, Error> {
-        let view = self.backend.begin_read().expect("read view");
-        Ok(view
-            .prefix_iterator(Table::LiveChain, &[])
-            .expect("iterator")
-            .filter_map(Result::ok)
-            .map(|(key, _)| decode_slot_root_key(&key).0)
-            .max())
     }
 
     /// Get all known block roots as HashSet.
